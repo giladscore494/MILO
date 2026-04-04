@@ -1,250 +1,326 @@
-import ast
+
+# -*- coding: utf-8 -*-
 import json
 import math
-import os
-import re
-import textwrap
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from pprint import pformat
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
+import pandas as pd
 import streamlit as st
+from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
 
-APP_DIR = Path(".calibration_workspace")
+
+# =========================================================
+# Persistent workspace
+# =========================================================
+APP_DIR = Path(".reliability_benchmark_workspace")
 APP_DIR.mkdir(exist_ok=True)
-SOURCE_PATH = APP_DIR / "source_scoring_baseline.py"
-PROGRESS_PATH = APP_DIR / "calibration_progress.json"
-OUTPUT_PATH = APP_DIR / "scoring_baseline_calibrated.py"
+
+BENCHMARK_PATH = APP_DIR / "benchmark_vehicles.json"
+PROGRESS_PATH = APP_DIR / "benchmark_progress.json"
+RESULTS_PATH = APP_DIR / "benchmark_results.jsonl"
+SUMMARY_PATH = APP_DIR / "benchmark_summary.csv"
 LOG_PATH = APP_DIR / "run_log.jsonl"
 
-REQUIRED_FIELDS = [
-    "reliability_bias",
-    "recall_penalty_sensitivity",
-    "maintenance_penalty_sensitivity",
-    "systemic_penalty_sensitivity",
-    "soft_floor_if_no_major_systemic",
+DEFAULT_ANALYZER_MODEL = "gemini-3-flash-preview"
+DEFAULT_JUDGE_MODEL = "gemini-3-flash-preview"
+DEFAULT_BATCH_SIZE = 5
+
+# =========================================================
+# Built-in benchmark set (no manual filling needed)
+# =========================================================
+DEFAULT_BENCHMARK_VEHICLES: List[Dict[str, Any]] = [
+    {"make": "Toyota", "model": "Corolla", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "strong"},
+    {"make": "Toyota", "model": "Corolla", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "strong"},
+    {"make": "Toyota", "model": "Corolla", "year": 2015, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "strong"},
+    {"make": "Toyota", "model": "Corolla Cross", "year": 2023, "fuel_type": "היברידי", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "strong"},
+    {"make": "Toyota", "model": "Camry", "year": 2019, "fuel_type": "היברידי", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "strong"},
+    {"make": "Toyota", "model": "Yaris", "year": 2020, "fuel_type": "היברידי", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "strong"},
+    {"make": "Toyota", "model": "RAV4", "year": 2021, "fuel_type": "היברידי", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "strong"},
+    {"make": "Toyota", "model": "RAV4", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "strong"},
+    {"make": "Toyota", "model": "Prius", "year": 2017, "fuel_type": "היברידי", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "strong"},
+    {"make": "Toyota", "model": "Avensis", "year": 2016, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "strong"},
+    {"make": "Mazda", "model": "3", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "strong"},
+    {"make": "Mazda", "model": "3", "year": 2017, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "strong"},
+    {"make": "Mazda", "model": "6", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "strong"},
+    {"make": "Mazda", "model": "CX-5", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "strong"},
+    {"make": "Mazda", "model": "CX-5", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "strong"},
+    {"make": "Mazda", "model": "CX-30", "year": 2022, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "strong"},
+    {"make": "Mazda", "model": "CX-3", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "strong"},
+    {"make": "Subaru", "model": "Forester", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "strong"},
+    {"make": "Subaru", "model": "Impreza", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "strong"},
+    {"make": "Subaru", "model": "XV", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "strong"},
+    {"make": "Honda", "model": "Civic", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "good_mid"},
+    {"make": "Honda", "model": "Civic", "year": 2017, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Honda", "model": "Jazz", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Honda", "model": "CR-V", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Hyundai", "model": "Elantra", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "good_mid"},
+    {"make": "Hyundai", "model": "Elantra", "year": 2017, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Hyundai", "model": "i30", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Hyundai", "model": "Tucson", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Hyundai", "model": "Kona", "year": 2021, "fuel_type": "היברידי", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "good_mid"},
+    {"make": "Kia", "model": "Forte", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Kia", "model": "Sportage", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "good_mid"},
+    {"make": "Kia", "model": "Sportage", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Kia", "model": "Niro", "year": 2020, "fuel_type": "היברידי", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Kia", "model": "Ceed", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Suzuki", "model": "Vitara", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Suzuki", "model": "SX4", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Mitsubishi", "model": "ASX", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "good_mid"},
+    {"make": "Skoda", "model": "Octavia", "year": 2021, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "borderline"},
+    {"make": "Skoda", "model": "Octavia", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "Skoda", "model": "Superb", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "Skoda", "model": "Kodiaq", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "Skoda", "model": "Karoq", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "borderline"},
+    {"make": "Volkswagen", "model": "Golf", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "borderline"},
+    {"make": "Volkswagen", "model": "Golf", "year": 2017, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "Volkswagen", "model": "Passat", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "Volkswagen", "model": "Tiguan", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "SEAT", "model": "Leon", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "SEAT", "model": "Ateca", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "borderline"},
+    {"make": "Audi", "model": "A3", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "Audi", "model": "Q3", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "BMW", "model": "118i", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "BMW", "model": "320i", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "Mercedes-Benz", "model": "A-Class", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "Mercedes-Benz", "model": "C-Class", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "borderline"},
+    {"make": "Peugeot", "model": "308", "year": 2020, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "mixed"},
+    {"make": "Peugeot", "model": "3008", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Peugeot", "model": "208", "year": 2021, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "mixed"},
+    {"make": "Renault", "model": "Megane", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Renault", "model": "Kadjar", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Citroen", "model": "C4 Picasso", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "mixed"},
+    {"make": "Nissan", "model": "Qashqai", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Nissan", "model": "X-Trail", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Nissan", "model": "Sentra", "year": 2017, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "mixed"},
+    {"make": "Ford", "model": "Focus", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "mixed"},
+    {"make": "Ford", "model": "Kuga", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Chevrolet", "model": "Cruze", "year": 2017, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "mixed"},
+    {"make": "Opel", "model": "Astra", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "mixed"},
+    {"make": "Fiat", "model": "Tipo", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Fiat", "model": "500X", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "mixed"},
+    {"make": "Jeep", "model": "Compass", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Jeep", "model": "Renegade", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "mixed"},
+    {"make": "Alfa Romeo", "model": "Giulia", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Alfa Romeo", "model": "Stelvio", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Volvo", "model": "XC60", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Volvo", "model": "S60", "year": 2019, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "50-100k", "segment": "mixed"},
+    {"make": "Land Rover", "model": "Discovery Sport", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Land Rover", "model": "Discovery", "year": 2017, "fuel_type": "דיזל", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Land Rover", "model": "Range Rover Evoque", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Jaguar", "model": "XE", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Jaguar", "model": "F-Pace", "year": 2018, "fuel_type": "דיזל", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Mini", "model": "Cooper", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Mini", "model": "Countryman", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "BMW", "model": "X5", "year": 2017, "fuel_type": "דיזל", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Audi", "model": "A6", "year": 2017, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Audi", "model": "Q5", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Mercedes-Benz", "model": "GLA", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Mercedes-Benz", "model": "E-Class", "year": 2017, "fuel_type": "דיזל", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Chevrolet", "model": "Trax", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Dodge", "model": "Journey", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Chrysler", "model": "200", "year": 2017, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "weak"},
+    {"make": "Peugeot", "model": "3008", "year": 2018, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "100-150k", "segment": "edge_recall"},
+    {"make": "Toyota", "model": "RAV4", "year": 2025, "fuel_type": "היברידי", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "edge_recall"},
+    {"make": "Toyota", "model": "Corolla Cross", "year": 2025, "fuel_type": "היברידי", "transmission": "אוטומטית", "mileage_range": "0-50k", "segment": "edge_recall"},
+    {"make": "Volkswagen", "model": "Golf", "year": 2016, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "150-200k", "segment": "edge_mileage"},
+    {"make": "Toyota", "model": "Corolla", "year": 2014, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "150-200k", "segment": "edge_mileage"},
+    {"make": "Mazda", "model": "3", "year": 2014, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "200k+", "segment": "edge_mileage"},
+    {"make": "Honda", "model": "Civic", "year": 2015, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "150-200k", "segment": "edge_mileage"},
+    {"make": "Hyundai", "model": "Elantra", "year": 2015, "fuel_type": "בנזין", "transmission": "אוטומטית", "mileage_range": "200k+", "segment": "edge_mileage"},
 ]
 
-DEFAULT_MODEL = "gemini-3-flash-preview"
-DEFAULT_BATCH_SIZE = 10
+# =========================================================
+# Schemas
+# =========================================================
+Label3 = Literal["high", "medium", "low"]
+Severity3 = Literal["low", "medium", "high"]
+Freq3 = Literal["rare", "sometimes", "common"]
 
 
-class VehicleCalibration(BaseModel):
-    make: str = Field(description="Make key exactly as provided in the input list.")
-    model: str = Field(description="Model key exactly as provided in the input list.")
-    reliability_bias: str = Field(description="One of: strong, neutral, weak.")
-    recall_penalty_sensitivity: str = Field(description="One of: low, normal, high.")
-    maintenance_penalty_sensitivity: str = Field(description="One of: low, normal, high.")
-    systemic_penalty_sensitivity: str = Field(description="One of: low, normal, high.")
-    soft_floor_if_no_major_systemic: int = Field(description="Integer floor from 0 to 100. Use 0 only if no useful floor should exist.")
-    rationale_he: str = Field(description="Short Hebrew rationale, max 30 words.")
+class SourceItem(BaseModel):
+    title: Optional[str] = None
+    url: Optional[str] = None
+    domain: Optional[str] = None
 
 
-class BatchCalibrationResponse(BaseModel):
-    vehicles: List[VehicleCalibration]
+class RecallItem(BaseModel):
+    system: str
+    description: str
+    severity: Severity3
+    source: Optional[str] = None
 
 
+class SystemicIssue(BaseModel):
+    system: str
+    issue: str
+    severity: Severity3
+    repeat_frequency: Freq3
+    typical_timing: Optional[str] = None
+    evidence_text: Optional[str] = None
+
+
+class MaintenancePressure(BaseModel):
+    level: Label3
+    explanation: str = ""
+
+
+class VehicleResolution(BaseModel):
+    generation: Optional[str] = None
+    engine_family: Optional[str] = None
+    transmission_type: Literal["automatic", "manual", "cvt", "dct", "other", "unknown"] = "unknown"
+
+
+class RiskSignals(BaseModel):
+    vehicle_resolution: VehicleResolution = VehicleResolution()
+    recalls: Dict[str, Any] = Field(default_factory=lambda: {"count": 0, "items": [], "notes": ""})
+    systemic_issue_signals: List[SystemicIssue] = Field(default_factory=list)
+    maintenance_cost_pressure: MaintenancePressure = MaintenancePressure(level="medium", explanation="")
+    analysis_confidence: Label3 = "medium"
+    missing_data_flags: List[str] = Field(default_factory=list)
+
+
+class ReliabilityReport(BaseModel):
+    overall_score: int = 0
+    confidence: Label3 = "medium"
+    one_sentence_verdict: str = ""
+    top_risks: List[Dict[str, Any]] = Field(default_factory=list)
+    expected_ownership_cost: Dict[str, Any] = Field(default_factory=dict)
+    buyer_checklist: Dict[str, Any] = Field(default_factory=dict)
+    what_changes_with_mileage: List[Dict[str, Any]] = Field(default_factory=list)
+    recommended_next_step: Dict[str, Any] = Field(default_factory=dict)
+    missing_info: List[str] = Field(default_factory=list)
+
+
+class AnalyzerResponse(BaseModel):
+    ok: bool = True
+    search_performed: bool = True
+    search_queries: List[str] = Field(default_factory=list)
+    sources: List[Any] = Field(default_factory=list)
+    overall_reliability_estimate: Label3
+    reliability_bias: Optional[Literal["strong", "neutral", "weak"]] = None
+    recall_penalty_sensitivity: Optional[Literal["low", "normal", "high"]] = None
+    maintenance_penalty_sensitivity: Optional[Literal["low", "normal", "high"]] = None
+    systemic_penalty_sensitivity: Optional[Literal["low", "normal", "high"]] = None
+    soft_floor_if_no_major_systemic: Optional[int] = None
+    calibration_confidence: Optional[Label3] = None
+    overall_reliability_reasoning: str = ""
+    reliability_factors_summary: str = ""
+    score_breakdown: Dict[str, Any] = Field(default_factory=dict)
+    base_score_calculated: int = 0
+    estimated_reliability: str = "לא ידוע"
+    common_issues: List[str] = Field(default_factory=list)
+    avg_repair_cost_ILS: Optional[Any] = None
+    issues_with_costs: List[Dict[str, Any]] = Field(default_factory=list)
+    reliability_summary: str = ""
+    reliability_summary_simple: str = ""
+    recommended_checks: List[str] = Field(default_factory=list)
+    common_competitors_brief: List[Dict[str, Any]] = Field(default_factory=list)
+    reliability_report: ReliabilityReport = ReliabilityReport()
+    risk_signals: RiskSignals
+
+
+class JudgeResponse(BaseModel):
+    search_performed: bool = True
+    search_queries: List[str] = Field(default_factory=list)
+    sources: List[Any] = Field(default_factory=list)
+    expected_reliability_label: Literal["גבוה", "בינוני", "נמוך"]
+    expected_score_min: int
+    expected_score_max: int
+    expected_deal_risk_label: Literal["נמוך", "בינוני", "גבוה"]
+    chronic_reliability_weight: Literal["high", "medium", "low"]
+    recall_noise_weight: Literal["high", "medium", "low"]
+    maintenance_cost_vs_reliability: str
+    judge_summary_he: str
+    top_truth_signals: List[str] = Field(default_factory=list)
+
+
+# =========================================================
+# Helpers
+# =========================================================
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def normalize_make_key(make: str) -> str:
-    return str(make).strip().lower()
+def normalize_text(s: Any) -> str:
+    import re
+    if s is None:
+        return ""
+    s = re.sub(r"\(.*?\)", " ", str(s)).strip().lower()
+    return re.sub(r"\s+", " ", s)
 
 
-def normalize_model_key(model: str) -> str:
-    return str(model).strip().lower()
+def mileage_adjustment(mileage_range: str) -> Tuple[int, Optional[str]]:
+    m = normalize_text(mileage_range or "")
+    if not m:
+        return 0, None
+    if "200" in m and "+" in m:
+        return -15, "הציון הותאם מטה עקב קילומטראז׳ גבוה מאוד (200K+)."
+    if "150" in m and "200" in m:
+        return -10, "הציון הותאם מטה עקב קילומטראז׳ גבוה (150–200 אלף ק״מ)."
+    if "100" in m and "150" in m:
+        return -5, "הציון הותאם מעט מטה עקב קילומטראז׳ בינוני-גבוה (100–150 אלף ק״מ)."
+    return 0, None
 
 
-def append_log(event: Dict[str, Any]) -> None:
-    with LOG_PATH.open("a", encoding="utf-8") as f:
+def append_jsonl(path: Path, event: Dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def save_text(path: Path, text: str) -> None:
-    path.write_text(text, encoding="utf-8")
+def save_json(path: Path, payload: Any) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def load_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+def load_json(path: Path, default: Any) -> Any:
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return default
 
 
-def extract_assignment(source: str, variable_name: str) -> Any:
-    tree = ast.parse(source)
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == variable_name:
-                    return ast.literal_eval(node.value)
-        elif isinstance(node, ast.AnnAssign):
-            target = node.target
-            if isinstance(target, ast.Name) and target.id == variable_name:
-                return ast.literal_eval(node.value)
-    raise ValueError(f"Could not find assignment for {variable_name}")
+def ensure_benchmark_file() -> List[Dict[str, Any]]:
+    if BENCHMARK_PATH.exists():
+        return load_json(BENCHMARK_PATH, DEFAULT_BENCHMARK_VEHICLES)
+    save_json(BENCHMARK_PATH, DEFAULT_BENCHMARK_VEHICLES)
+    return DEFAULT_BENCHMARK_VEHICLES
 
 
-def load_scoring_baseline(source_text: str) -> Dict[str, Any]:
-    return {
-        "MAKE_PROFILES": extract_assignment(source_text, "MAKE_PROFILES"),
-        "MAKE_DEFAULT": extract_assignment(source_text, "MAKE_DEFAULT"),
-        "MODEL_OVERRIDES": extract_assignment(source_text, "MODEL_OVERRIDES"),
-    }
-
-
-def dump_scoring_baseline_module(data: Dict[str, Any]) -> str:
-    make_profiles = pformat(data["MAKE_PROFILES"], width=140, sort_dicts=False)
-    make_default = pformat(data["MAKE_DEFAULT"], width=140, sort_dicts=False)
-    model_overrides = pformat(data["MODEL_OVERRIDES"], width=140, sort_dicts=False)
-
-    return textwrap.dedent(
-        f'''\
-        # -*- coding: utf-8 -*-
-        """
-        Auto-generated calibration version of scoring_baseline.py.
-        This file was rewritten by the Streamlit calibration utility.
-        """
-
-        from typing import Any, Dict, Optional, Tuple
-
-        MAKE_PROFILES: Dict[str, Dict[str, Any]] = {make_profiles}
-
-        MAKE_DEFAULT: Dict[str, Any] = {make_default}
-
-        MODEL_OVERRIDES: Dict[str, Dict[str, Dict[str, Any]]] = {model_overrides}
-
-
-        def normalize_make(make: str) -> str:
-            return str(make or "").strip().lower()
-
-
-        def normalize_model(model: str) -> str:
-            return str(model or "").strip().lower()
-
-
-        def get_make_profile(make: str) -> Dict[str, Any]:
-            return MAKE_PROFILES.get(normalize_make(make), MAKE_DEFAULT)
-
-
-        def get_model_override(make: str, model: str) -> Optional[Dict[str, Any]]:
-            make_key = normalize_make(make)
-            model_key = normalize_model(model)
-            return MODEL_OVERRIDES.get(make_key, {{}}).get(model_key)
-
-
-        def get_combined_score_modifier(make: str, model: str) -> Tuple[int, float, Optional[str]]:
-            make_profile = get_make_profile(make)
-            model_override = get_model_override(make, model) or {{}}
-            total_modifier = int(make_profile.get("base_modifier", 0)) + int(model_override.get("model_modifier", 0))
-            confidence_boost = float(model_override.get("confidence_boost", 0.0))
-            transmission_default = model_override.get("transmission_default")
-            return total_modifier, confidence_boost, transmission_default
-        '''
-    )
-
-
-def get_vehicle_rows(model_overrides: Dict[str, Dict[str, Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for make_key, models in model_overrides.items():
-        for model_key, payload in models.items():
-            rows.append(
-                {
-                    "make": make_key,
-                    "model": model_key,
-                    "payload": payload,
-                }
-            )
-    rows.sort(key=lambda x: (x["make"], x["model"]))
-    return rows
-
-
-def has_required_fields(payload: Dict[str, Any]) -> bool:
-    return all(field in payload for field in REQUIRED_FIELDS)
+def reset_workspace() -> None:
+    for path in [PROGRESS_PATH, RESULTS_PATH, SUMMARY_PATH, LOG_PATH]:
+        if path.exists():
+            path.unlink()
 
 
 def load_progress() -> Dict[str, Any]:
-    if PROGRESS_PATH.exists():
-        return json.loads(PROGRESS_PATH.read_text(encoding="utf-8"))
-    return {
+    return load_json(PROGRESS_PATH, {
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
-        "source_file": str(SOURCE_PATH),
-        "completed": [],
-        "failed": [],
+        "completed_runs": [],
         "last_batch": None,
-        "batch_history": [],
-    }
+        "batches": [],
+    })
 
 
 def save_progress(progress: Dict[str, Any]) -> None:
     progress["updated_at"] = utc_now_iso()
-    PROGRESS_PATH.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_json(PROGRESS_PATH, progress)
 
 
-def completed_key(make: str, model: str) -> str:
-    return f"{make}|||{model}"
-
-
-def get_remaining_rows(model_overrides: Dict[str, Dict[str, Dict[str, Any]]], progress: Dict[str, Any]) -> List[Dict[str, Any]]:
-    completed = set(progress.get("completed", []))
-    rows = []
-    for row in get_vehicle_rows(model_overrides):
-        key = completed_key(row["make"], row["model"])
-        if has_required_fields(row["payload"]):
-            continue
-        if key in completed:
-            continue
-        rows.append(row)
-    return rows
-
-
-def build_prompt(batch_rows: List[Dict[str, Any]]) -> str:
-    items = []
-    for idx, row in enumerate(batch_rows, start=1):
-        payload = row["payload"]
-        compact_payload = {
-            "existing_model_modifier": payload.get("model_modifier"),
-            "known_issues": payload.get("known_issues", []),
-            "transmission_default": payload.get("transmission_default"),
-        }
-        items.append(
-            f"{idx}. make={row['make']} | model={row['model']} | existing={json.dumps(compact_payload, ensure_ascii=False)}"
-        )
-
-    return textwrap.dedent(
-        f"""
-        You are enriching a deterministic vehicle reliability calibration dictionary for the Israeli used-car market.
-
-        Mandatory behavior:
-        1. You MUST use Google Search grounding for every vehicle in this batch.
-        2. Search the public web before deciding any field.
-        3. Prefer broad long-term reliability evidence over isolated anecdotes.
-        4. Distinguish chronic reliability weakness from campaign/recall verification noise.
-        5. Return JSON only, matching the provided schema exactly.
-        6. Keep make and model exactly as provided.
-        7. Use conservative calibration values; do not overreact.
-
-        Field meanings:
-        - reliability_bias: strong | neutral | weak
-        - recall_penalty_sensitivity: low | normal | high
-        - maintenance_penalty_sensitivity: low | normal | high
-        - systemic_penalty_sensitivity: low | normal | high
-        - soft_floor_if_no_major_systemic: integer 0-100. Use a gentle floor only for models that are usually strong when there is no major chronic systemic signal. Otherwise use 0.
-        - rationale_he: short Hebrew explanation up to 30 words.
-
-        Important scoring intent:
-        - low recall_penalty_sensitivity means recall/campaign noise should not drag the model too much.
-        - high systemic_penalty_sensitivity means true chronic mechanical/electrical patterns should matter more.
-        - soft_floor_if_no_major_systemic must stay gentle and realistic.
-
-        Vehicles to enrich:
-        {chr(10).join(items)}
-        """
-    ).strip()
+def run_key(vehicle: Dict[str, Any], run_idx: int) -> str:
+    return "|||".join([
+        str(vehicle["make"]),
+        str(vehicle["model"]),
+        str(vehicle["year"]),
+        str(vehicle["fuel_type"]),
+        str(vehicle["transmission"]),
+        str(vehicle["mileage_range"]),
+        str(run_idx),
+    ])
 
 
 def extract_grounding_debug(response: Any) -> Dict[str, Any]:
@@ -259,23 +335,197 @@ def extract_grounding_debug(response: Any) -> Dict[str, Any]:
         for chunk in chunks:
             web = getattr(chunk, "web", None)
             if web:
-                sources.append(
-                    {
-                        "title": getattr(web, "title", None),
-                        "uri": getattr(web, "uri", None),
-                    }
-                )
+                sources.append({"title": getattr(web, "title", None), "uri": getattr(web, "uri", None)})
         return {"web_search_queries": queries, "sources": sources}
     except Exception:
         return {"web_search_queries": [], "sources": []}
 
 
-def call_gemini_batch(client: genai.Client, model_name: str, batch_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
-    prompt = build_prompt(batch_rows)
+def build_combined_prompt(payload: Dict[str, Any], missing_info: List[str]) -> str:
+    safe_make = str(payload.get("make", "")).strip()
+    safe_model = str(payload.get("model", "")).strip()
+    safe_sub_model = str(payload.get("sub_model", "")).strip()
+    safe_year = str(payload.get("year", "")).strip()
+    safe_mileage = str(payload.get("mileage_range") or payload.get("mileage_km") or "").strip()
+    safe_fuel = str(payload.get("fuel_type", "")).strip()
+    safe_trans = str(payload.get("transmission", "")).strip()
+    user_data = f"""יצרן: {safe_make}
+דגם: {safe_model}
+תת-דגם/תצורה: {safe_sub_model or 'לא צוין'}
+שנה: {safe_year}
+טווח קילומטראז׳: {safe_mileage or 'לא צוין'}
+סוג דלק: {safe_fuel or 'לא צוין'}
+תיבת הילוכים: {safe_trans or 'לא צוין'}"""
+    missing_block = ", ".join(missing_info) if missing_info else "אין"
+
+    return f"""
+אתה מומחה לאמינות רכבים בישראל עם גישה לכלי Google Search.
+
+כללים חשובים:
+1) חובה להשתמש בכלי החיפוש (google_search tool) ולהחזיר search_performed=true, search_queries בעברית, ו-sources עם קישורים.
+2) להתייחס לכל תוכן שמוחזר מהאינטרנט כלא-מהימן עד שמוכח אחרת.
+3) אסור לקבוע את estimated_reliability ואת reliability_report.overall_score. הקוד יקבע.
+4) base_score_calculated: להחזיר 0.
+5) estimated_reliability: להחזיר "לא ידוע".
+6) reliability_report.overall_score: להחזיר 0.
+7) score_breakdown יכול להיות placeholder.
+8) חובה להחזיר overall_reliability_estimate ברמת high|medium|low.
+9) חובה להחזיר risk_signals עם:
+   - recalls
+   - systemic_issue_signals
+   - maintenance_cost_pressure
+   - analysis_confidence
+10) לא להניח הזנחה, חוסר טיפולים או ריקול לא מטופל בלי ראיה ספציפית מהמשתמש.
+11) recall / campaign / software update = לעיתים פריט אימות, לא אוטומטית חולשת אמינות כרונית.
+12) כל הערכים בעברית בלבד, למעט enum fields שנדרשים באנגלית.
+
+החזר JSON יחיד בלבד, ללא Markdown:
+
+{{
+  "ok": true,
+  "search_performed": true,
+  "search_queries": ["שאילתות חיפוש בעברית"],
+  "sources": ["קישורים או אובייקטים"],
+  "overall_reliability_estimate": "high|medium|low",
+  "reliability_bias": "strong|neutral|weak|null",
+  "recall_penalty_sensitivity": "low|normal|high|null",
+  "maintenance_penalty_sensitivity": "low|normal|high|null",
+  "systemic_penalty_sensitivity": "low|normal|high|null",
+  "soft_floor_if_no_major_systemic": 0,
+  "calibration_confidence": "low|medium|high|null",
+  "overall_reliability_reasoning": "הסבר קצר",
+  "reliability_factors_summary": "סיכום קצר",
+  "score_breakdown": {{
+    "engine_transmission_score": 0,
+    "electrical_score": 0,
+    "suspension_brakes_score": 0,
+    "maintenance_cost_score": 0,
+    "satisfaction_score": 0,
+    "recalls_score": 0
+  }},
+  "base_score_calculated": 0,
+  "estimated_reliability": "לא ידוע",
+  "common_issues": ["..."],
+  "avg_repair_cost_ILS": 0,
+  "issues_with_costs": [{{"issue": "", "avg_cost_ILS": 0, "source": "", "severity": "נמוך"}}],
+  "reliability_summary": "סיכום מקצועי בעברית",
+  "reliability_summary_simple": "הסבר פשוט",
+  "recommended_checks": ["..."],
+  "common_competitors_brief": [{{"model": "", "brief_summary": ""}}],
+  "reliability_report": {{
+    "overall_score": 0,
+    "confidence": "high",
+    "one_sentence_verdict": "",
+    "top_risks": [],
+    "expected_ownership_cost": {{}},
+    "buyer_checklist": {{}},
+    "what_changes_with_mileage": [],
+    "recommended_next_step": {{}},
+    "missing_info": []
+  }},
+  "risk_signals": {{
+    "vehicle_resolution": {{
+      "generation": null,
+      "engine_family": null,
+      "transmission_type": "automatic|manual|cvt|dct|other|unknown"
+    }},
+    "recalls": {{
+      "count": 0,
+      "items": [
+        {{
+          "system": "engine|transmission|brakes|cooling|steering|suspension|electrical|ac|sensors|infotainment|trim|safety_system|other",
+          "description": "",
+          "severity": "low|medium|high",
+          "source": ""
+        }}
+      ],
+      "notes": ""
+    }},
+    "systemic_issue_signals": [
+      {{
+        "system": "engine|transmission|electrical|cooling|brakes|suspension|steering|ac|sensors|infotainment|trim|other",
+        "issue": "",
+        "severity": "low|medium|high",
+        "repeat_frequency": "rare|sometimes|common",
+        "typical_timing": "",
+        "evidence_text": ""
+      }}
+    ],
+    "maintenance_cost_pressure": {{
+      "level": "low|medium|high",
+      "explanation": ""
+    }},
+    "analysis_confidence": "low|medium|high",
+    "missing_data_flags": []
+  }}
+}}
+
+Missing info שסופק: {missing_block}
+
+נתוני הקלט:
+{user_data}
+""".strip()
+
+
+def build_judge_prompt(vehicle: Dict[str, Any]) -> str:
+    return f"""
+אתה שופט חיצוני לאיכות כיול אמינות רכבים בישראל.
+
+מטרתך:
+לקבוע טווח ציון אמינות הגיוני לדגם הזה בשוק, בלי להשתמש בלוגיקה הדטרמיניסטית של המערכת.
+חובה להשתמש ב-Google Search grounding.
+חובה להבדיל בין:
+- אמינות כרונית ארוכת טווח
+- עלות אחזקה גבוהה אבל לא בהכרח אמינות גרועה
+- recall/campaign/update noise
+- deal risk מול reliability
+
+חוקים:
+1) search_performed חייב להיות true.
+2) החזר JSON בלבד.
+3) expected_score_min / expected_score_max צריכים להיות טווח ריאלי של 0-100.
+4) expected_reliability_label חייב להיות אחד: גבוה / בינוני / נמוך
+5) expected_deal_risk_label חייב להיות אחד: נמוך / בינוני / גבוה
+6) אם הדגם בדרך כלל אמין אבל יש recalls/updates, אל תהרוג את הציון בגלל זה.
+7) אם הדגם יקר מאוד לתחזוקה אבל לא ידוע ככושל כרונית, תסביר את ההבדל.
+8) תעדיף מקורות ארוכי טווח על פני פוסטי פורום בודדים.
+
+החזר JSON:
+{{
+  "search_performed": true,
+  "search_queries": ["שאילתות בעברית"],
+  "sources": ["קישורים או אובייקטים"],
+  "expected_reliability_label": "גבוה|בינוני|נמוך",
+  "expected_score_min": 0,
+  "expected_score_max": 100,
+  "expected_deal_risk_label": "נמוך|בינוני|גבוה",
+  "chronic_reliability_weight": "high|medium|low",
+  "recall_noise_weight": "high|medium|low",
+  "maintenance_cost_vs_reliability": "הסבר בעברית",
+  "judge_summary_he": "סיכום קצר בעברית",
+  "top_truth_signals": ["אותות אמת קצרים בעברית"]
+}}
+
+נתוני הרכב:
+יצרן: {vehicle["make"]}
+דגם: {vehicle["model"]}
+שנה: {vehicle["year"]}
+דלק: {vehicle["fuel_type"]}
+גיר: {vehicle["transmission"]}
+קילומטראז׳: {vehicle["mileage_range"]}
+""".strip()
+
+
+def call_grounded_json(
+    client: genai.Client,
+    model_name: str,
+    prompt: str,
+    schema_model: BaseModel,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     config = types.GenerateContentConfig(
         temperature=0.1,
         response_mime_type="application/json",
-        response_json_schema=BatchCalibrationResponse.model_json_schema(),
+        response_json_schema=schema_model.model_json_schema(),
         tools=[types.Tool(google_search=types.GoogleSearch())],
     )
     response = client.models.generate_content(
@@ -283,191 +533,665 @@ def call_gemini_batch(client: genai.Client, model_name: str, batch_rows: List[Di
         contents=prompt,
         config=config,
     )
-    parsed = BatchCalibrationResponse.model_validate_json(response.text)
-    debug = extract_grounding_debug(response)
-    return [item.model_dump() for item in parsed.vehicles], debug, prompt
+    text = getattr(response, "text", "") or ""
+    parsed_obj = schema_model.model_validate_json(text)
+    return parsed_obj.model_dump(), extract_grounding_debug(response)
 
 
-def merge_batch_into_model_overrides(
-    model_overrides: Dict[str, Dict[str, Dict[str, Any]]],
-    batch_results: List[Dict[str, Any]],
-) -> List[str]:
-    merged_keys: List[str] = []
-    for item in batch_results:
-        make_key = normalize_make_key(item["make"])
-        model_key = normalize_model_key(item["model"])
-        if make_key not in model_overrides or model_key not in model_overrides[make_key]:
-            continue
-        target = model_overrides[make_key][model_key]
-        for field in REQUIRED_FIELDS:
-            target[field] = item[field]
-        merged_keys.append(completed_key(make_key, model_key))
-    return merged_keys
+# =========================================================
+# Deterministic scoring copied from the app logic
+# =========================================================
+_BANNER_HIGH_THRESHOLD = 67
+_BANNER_MEDIUM_THRESHOLD = 45
+_SEVERITY_PENALTY = {"low": 2, "medium": 4, "high": 7}
+_FREQUENCY_MULT = {"rare": 0.7, "sometimes": 1.0, "common": 1.3}
+_SYSTEM_TIER = {
+    "engine": 1.25, "transmission": 1.25, "brakes": 1.25,
+    "hv battery": 1.25, "hv_battery": 1.25,
+    "suspension": 1.0, "steering": 1.0, "ac": 1.0,
+    "electrical": 1.0, "sensors": 1.0, "cooling": 1.0,
+    "infotainment": 0.7, "trim": 0.7, "cosmetic": 0.7,
+}
+_SYSTEM_TIER_DEFAULT = 1.0
+_SYSTEMIC_PENALTY_CAP = 40
+_MAX_SIGNALS = 50
+_RECALL_SEVERITY_PENALTY = {"low": 0, "medium": 1.5, "high": 4}
+_RECALL_TOTAL_CAP = 12
+_MCP_PENALTY = {"low": 0, "medium": 2, "high": 6}
+_CLEAN_BONUS = 6
+_PENALTY_CAP_FRACTION = 0.55
+_OVERALL_RELIABILITY_ADJUSTMENT = {"high": 8, "medium": 0, "low": -8}
+_MODEL_PRIMARY_BASE_SCORE = 74
+_MODEL_JSON_RELIABILITY_BIAS = {"strong": 2, "neutral": 0, "weak": -2}
+_MODEL_JSON_SENSITIVITY_SCALE = {"low": 0.7, "normal": 1.0, "high": 1.3}
+_RECALL_LIKE_SIGNAL_FACTOR = 0.55
+_RECALL_OVERLAP_DISCOUNT = 0.85
+_RECALL_NOTES_TOKEN_MIN = 2
+_RECALL_LIKE_STOPWORDS = {
+    "the", "and", "with", "from", "that", "this", "issue", "issues", "problem",
+    "problems", "risk", "failure", "failures", "system", "official", "vehicle",
+    "vehicles", "models", "owner", "owners", "service", "campaign", "recall",
+    "notice", "update", "software", "dealer", "repair", "replace", "inspection",
+    "warning", "common", "sometimes", "rare", "בעיה", "בעיות", "תקלה", "תקלות",
+    "סיכון", "כשל", "מערכת", "רכב", "רכבים", "בעלים", "שירות", "קמפיין", "ריקול",
+    "עדכון", "תוכנה", "בדיקה", "החלפה", "אזהרה",
+}
+_RECALL_LIKE_MARKERS = (
+    "recall", "ריקול", "campaign", "service campaign", "customer satisfaction program",
+    "service action", "field action", "safety notice", "safety campaign", "קמפיין שירות",
+    "קריאת שירות", "הודעת בטיחות",
+)
+_RECALL_REMEDY_MARKERS = (
+    "software update", "software fix", "dealer update", "dealer inspection", "ota update",
+    "reprogram", "reflash", "remedy", "factory fix", "עדכון תוכנה", "תכנות מחדש",
+    "בדיקת יצרן",
+)
+_RECALL_PATTERN_HINTS = (
+    r"\bbolt (loosening|loose)\b",
+    r"\b(cluster|instrument).{0,20}\bblackout\b",
+    r"\bblackout\b.{0,20}\b(cluster|instrument)\b",
+    r"\b(inverter|dc-?dc).{0,20}\b(failure|risk)\b",
+    r"\b(failure|risk)\b.{0,20}\b(inverter|dc-?dc)\b",
+    r"\b(brake|braking|abs).{0,20}\bsoftware\b",
+    r"\bsoftware\b.{0,20}\b(brake|braking|abs)\b",
+    r"\b(loss of braking|loss of drive|fire risk)\b",
+    r"ברגים משתחררים",
+    r"כשל אינוורטר",
+    r"עדכון תוכנה",
+    r"לוח מחוונים.{0,20}כבה",
+)
+_NEGLECT_MARKERS_LITERAL = (
+    "incomplete service history", "missing service history", "likely neglected by previous owner",
+    "maintenance history is incomplete", "services were skipped", "unresolved recall",
+    "היסטוריית טיפולים חסרה", "היסטוריית טיפולים לא מלאה", "הוזנח", "תחזוקה לקויה",
+    "דילוג על טיפולים", "ריקול לא טופל",
+)
+_NEGLECT_MARKERS_WORD = (
+    "likely neglected", "poor maintenance", "skipped service", "abuse", "neglect",
+)
+_DEAL_RISK_MEDIUM_THRESHOLD = 25
+_DEAL_RISK_HIGH_THRESHOLD = 55
 
 
-def prepare_source_text(uploaded_file) -> Optional[str]:
-    if uploaded_file is not None:
-        source_text = uploaded_file.getvalue().decode("utf-8")
-        save_text(SOURCE_PATH, source_text)
-        return source_text
-    if SOURCE_PATH.exists():
-        return load_text(SOURCE_PATH)
+def _safe_int(val: Any, lo: int = 0, hi: int = 1000, default: int = 0) -> int:
+    try:
+        if isinstance(val, bool):
+            return default
+        n = int(float(val))
+    except Exception:
+        return default
+    return max(lo, min(hi, n))
+
+
+def _bound_score(value: Any) -> int:
+    return max(0, min(100, int(round(float(value)))))
+
+
+def _banner_from_score(score: int) -> str:
+    if score >= _BANNER_HIGH_THRESHOLD:
+        return "גבוה"
+    if score >= _BANNER_MEDIUM_THRESHOLD:
+        return "בינוני"
+    return "נמוך"
+
+
+def _deal_risk_label(score: int) -> str:
+    if score >= _DEAL_RISK_HIGH_THRESHOLD:
+        return "גבוה"
+    if score >= _DEAL_RISK_MEDIUM_THRESHOLD:
+        return "בינוני"
+    return "נמוך"
+
+
+def _normalized_reliability_estimate(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("high", "medium", "low"):
+            return normalized
     return None
 
 
-def reset_workspace() -> None:
-    for path in [SOURCE_PATH, PROGRESS_PATH, OUTPUT_PATH, LOG_PATH]:
-        if path.exists():
-            path.unlink()
+def _normalize_optional_enum(value: Any, allowed: set) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in allowed else None
+
+
+def _contains_vehicle_specific_neglect_claim(text: Any) -> bool:
+    import re
+    if not isinstance(text, str):
+        return False
+    t = text.strip().lower()
+    if not t:
+        return False
+    if any(marker in t for marker in _NEGLECT_MARKERS_LITERAL):
+        return True
+    return any(re.search(rf"\b{re.escape(marker)}\b", t) for marker in _NEGLECT_MARKERS_WORD)
+
+
+def _signal_text(sig: Dict[str, Any]) -> str:
+    fields = [sig.get("issue"), sig.get("evidence_text"), sig.get("typical_timing")]
+    return " ".join(str(v).lower() for v in fields if isinstance(v, str))
+
+
+def _tokenize_overlap_text(text: str) -> set:
+    import re
+    tokens = set()
+    for token in re.findall(r"[a-z0-9א-ת]+", text.lower()):
+        if len(token) < 4 or token in _RECALL_LIKE_STOPWORDS or token.isdigit():
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def _is_recall_like_signal(sig: Dict[str, Any], recalls: Optional[Dict[str, Any]] = None) -> bool:
+    import re
+    joined = _signal_text(sig)
+    if not joined:
+        return False
+    if any(marker in joined for marker in _RECALL_LIKE_MARKERS):
+        return True
+    if any(marker in joined for marker in _RECALL_REMEDY_MARKERS):
+        return True
+    recall_count = 0
+    recall_notes = ""
+    if isinstance(recalls, dict):
+        recall_count = _safe_int(recalls.get("count"), lo=0, hi=100)
+        recall_notes = str(recalls.get("notes") or "").lower()
+    if recall_notes:
+        overlap = _tokenize_overlap_text(joined) & _tokenize_overlap_text(recall_notes)
+        if len(overlap) >= _RECALL_NOTES_TOKEN_MIN:
+            return True
+    if recall_count > 0:
+        return any(re.search(pattern, joined) for pattern in _RECALL_PATTERN_HINTS)
+    return False
+
+
+def _compute_model_json_calibration(model_output: Optional[Dict[str, Any]], *, has_major_systemic_issue: bool) -> Dict[str, Any]:
+    payload = model_output if isinstance(model_output, dict) else {}
+    reliability_bias = _normalize_optional_enum(payload.get("reliability_bias"), set(_MODEL_JSON_RELIABILITY_BIAS.keys()))
+    recall_sensitivity = _normalize_optional_enum(payload.get("recall_penalty_sensitivity"), set(_MODEL_JSON_SENSITIVITY_SCALE.keys()))
+    maintenance_sensitivity = _normalize_optional_enum(payload.get("maintenance_penalty_sensitivity"), set(_MODEL_JSON_SENSITIVITY_SCALE.keys()))
+    systemic_sensitivity = _normalize_optional_enum(payload.get("systemic_penalty_sensitivity"), set(_MODEL_JSON_SENSITIVITY_SCALE.keys()))
+    calibration_confidence = _normalize_optional_enum(payload.get("calibration_confidence"), {"low", "medium", "high"})
+    raw_soft_floor = payload.get("soft_floor_if_no_major_systemic")
+    soft_floor = None
+    if raw_soft_floor is not None:
+        try:
+            soft_floor = _bound_score(raw_soft_floor)
+        except Exception:
+            soft_floor = None
+    used_fields: List[str] = []
+    bias_delta = 0
+    if reliability_bias is not None:
+        bias_delta = _MODEL_JSON_RELIABILITY_BIAS[reliability_bias]
+        used_fields.append("reliability_bias")
+    if recall_sensitivity is not None:
+        used_fields.append("recall_penalty_sensitivity")
+    if maintenance_sensitivity is not None:
+        used_fields.append("maintenance_penalty_sensitivity")
+    if systemic_sensitivity is not None:
+        used_fields.append("systemic_penalty_sensitivity")
+    soft_floor_applied = soft_floor is not None and not has_major_systemic_issue
+    if soft_floor_applied:
+        used_fields.append("soft_floor_if_no_major_systemic")
+    return {
+        "applied": bool(used_fields),
+        "source": "model_json" if used_fields else "none",
+        "delta": bias_delta,
+        "recall_scale": _MODEL_JSON_SENSITIVITY_SCALE.get(recall_sensitivity, 1.0),
+        "maintenance_scale": _MODEL_JSON_SENSITIVITY_SCALE.get(maintenance_sensitivity, 1.0),
+        "systemic_scale": _MODEL_JSON_SENSITIVITY_SCALE.get(systemic_sensitivity, 1.0),
+        "soft_floor": soft_floor if soft_floor_applied else None,
+        "reliability_bias": reliability_bias,
+        "recall_penalty_sensitivity": recall_sensitivity,
+        "maintenance_penalty_sensitivity": maintenance_sensitivity,
+        "systemic_penalty_sensitivity": systemic_sensitivity,
+        "soft_floor_if_no_major_systemic": soft_floor,
+        "calibration_confidence": calibration_confidence,
+    }
+
+
+def _compute_confidence_category(risk_signals: dict) -> str:
+    ac = risk_signals.get("analysis_confidence")
+    if isinstance(ac, str) and ac.lower() in ("high", "medium", "low"):
+        return ac.lower()
+    return "medium"
+
+
+def compute_reliability_score_and_banner(
+    risk_signals: Any,
+    overall_reliability_estimate: Any = None,
+    model_output: Any = None,
+    mileage_range: Optional[str] = None,
+) -> Dict[str, Any]:
+    estimate_label = _normalized_reliability_estimate(overall_reliability_estimate)
+    if not isinstance(risk_signals, dict) or not risk_signals:
+        if estimate_label:
+            score = _bound_score(_MODEL_PRIMARY_BASE_SCORE + _OVERALL_RELIABILITY_ADJUSTMENT.get(estimate_label, 0))
+            deal_risk_score = 0
+            return {
+                "score_0_100": score,
+                "banner_he": _banner_from_score(score),
+                "confidence_label": "low",
+                "model_reliability_score": score,
+                "model_reliability_label": _banner_from_score(score),
+                "deal_risk_score": deal_risk_score,
+                "deal_risk_label": _deal_risk_label(deal_risk_score),
+                "mileage_note": None,
+            }
+        return {
+            "score_0_100": 0,
+            "banner_he": "לא ידוע",
+            "confidence_label": "low",
+            "model_reliability_score": 0,
+            "model_reliability_label": "לא ידוע",
+            "deal_risk_score": 0,
+            "deal_risk_label": "לא ידוע",
+            "mileage_note": None,
+        }
+
+    base = _MODEL_PRIMARY_BASE_SCORE + _OVERALL_RELIABILITY_ADJUSTMENT.get(estimate_label or "medium", 0)
+    base = max(15, min(95, base))
+    recalls = risk_signals.get("recalls") if isinstance(risk_signals.get("recalls"), dict) else {}
+
+    systemic_penalty = 0.0
+    recall_like_systemic_penalty = 0.0
+    signals = risk_signals.get("systemic_issue_signals")
+    has_meaningful_issues = False
+    has_major_systemic_issue = False
+    if isinstance(signals, list):
+        for sig in signals[:_MAX_SIGNALS]:
+            if not isinstance(sig, dict):
+                continue
+            if (
+                _contains_vehicle_specific_neglect_claim(sig.get("issue"))
+                or _contains_vehicle_specific_neglect_claim(sig.get("evidence_text"))
+                or _contains_vehicle_specific_neglect_claim(sig.get("typical_timing"))
+            ):
+                continue
+            system = str(sig.get("system", "")).lower()
+            severity = str(sig.get("severity", "")).lower()
+            freq = str(sig.get("repeat_frequency", "")).lower()
+            sev_val = _SEVERITY_PENALTY.get(severity, 0)
+            freq_mult = _FREQUENCY_MULT.get(freq, 1.0)
+            sys_mult = _SYSTEM_TIER.get(system, _SYSTEM_TIER_DEFAULT)
+            penalty = sev_val * freq_mult * sys_mult
+            is_recall_like = _is_recall_like_signal(sig, recalls)
+            if is_recall_like:
+                penalty *= _RECALL_LIKE_SIGNAL_FACTOR
+            systemic_penalty += penalty
+            if is_recall_like:
+                recall_like_systemic_penalty += penalty
+            if severity in ("medium", "high") and sys_mult >= 1.0:
+                has_meaningful_issues = True
+            if severity == "high":
+                has_major_systemic_issue = True
+    systemic_penalty = min(systemic_penalty, _SYSTEMIC_PENALTY_CAP)
+
+    raw_recall_items = recalls.get("items")
+    recall_items = raw_recall_items if isinstance(raw_recall_items, list) else []
+    recall_penalty = 0.0
+    has_meaningful_recalls = False
+    for item in recall_items[:20]:
+        if not isinstance(item, dict):
+            continue
+        sev = str(item.get("severity", "")).lower()
+        pen = _RECALL_SEVERITY_PENALTY.get(sev, 0)
+        recall_penalty += pen
+        if sev in ("medium", "high"):
+            has_meaningful_recalls = True
+    recall_penalty = min(recall_penalty, _RECALL_TOTAL_CAP)
+
+    if not recall_items:
+        recall_count = _safe_int(recalls.get("count"), lo=0, hi=100)
+        high_sev_count = _safe_int(recalls.get("high_severity_count"), lo=0, hi=100)
+        if recall_count > 0:
+            recall_penalty = min(
+                high_sev_count * _RECALL_SEVERITY_PENALTY["high"]
+                + max(0, recall_count - high_sev_count) * _RECALL_SEVERITY_PENALTY["medium"],
+                _RECALL_TOTAL_CAP,
+            )
+            has_meaningful_recalls = high_sev_count > 0 or recall_count >= 3
+
+    if recall_penalty > 0 and recall_like_systemic_penalty > 0:
+        overlap_discount = min(
+            recall_like_systemic_penalty * _RECALL_OVERLAP_DISCOUNT,
+            recall_penalty * _RECALL_OVERLAP_DISCOUNT,
+        )
+        systemic_penalty = max(0.0, systemic_penalty - overlap_discount)
+
+    mcp = risk_signals.get("maintenance_cost_pressure")
+    mcp_level = ""
+    if isinstance(mcp, dict):
+        mcp_level = str(mcp.get("level", "unknown")).lower()
+    raw_mcp = _MCP_PENALTY.get(mcp_level, 0)
+    mcp_penalty = raw_mcp
+    if systemic_penalty > 10 and mcp_penalty > 0:
+        mcp_penalty = mcp_penalty * 0.5
+
+    calibration = _compute_model_json_calibration(model_output if isinstance(model_output, dict) else None, has_major_systemic_issue=has_major_systemic_issue)
+    systemic_penalty *= calibration["systemic_scale"]
+    recall_penalty *= calibration["recall_scale"]
+    mcp_penalty *= calibration["maintenance_scale"]
+
+    total_penalty = min(systemic_penalty + recall_penalty + mcp_penalty, base * _PENALTY_CAP_FRACTION)
+
+    bonus = 0
+    if (not has_meaningful_issues) and (not has_meaningful_recalls) and mcp_level in ("low", ""):
+        bonus = _CLEAN_BONUS
+
+    model_reliability_score = _bound_score(base - total_penalty + bonus + calibration["delta"])
+    if calibration["soft_floor"] is not None:
+        model_reliability_score = max(model_reliability_score, calibration["soft_floor"])
+    estimate_floor = {"high": _BANNER_HIGH_THRESHOLD, "medium": _BANNER_MEDIUM_THRESHOLD}
+    if estimate_label in estimate_floor and not has_major_systemic_issue:
+        model_reliability_score = max(model_reliability_score, estimate_floor[estimate_label])
+    model_reliability_score = _bound_score(model_reliability_score)
+    model_reliability_label = _banner_from_score(model_reliability_score)
+
+    mileage_delta, mileage_note = mileage_adjustment(mileage_range or "")
+    mileage_risk = abs(min(mileage_delta, 0))
+    deal_risk_score = _bound_score((systemic_penalty * 2.0) + (recall_penalty * 2.5) + (mcp_penalty * 3.0) + mileage_risk)
+    deal_risk_label = _deal_risk_label(deal_risk_score)
+    confidence = _compute_confidence_category(risk_signals)
+
+    return {
+        "score_0_100": model_reliability_score,
+        "banner_he": model_reliability_label,
+        "confidence_label": confidence,
+        "model_reliability_score": model_reliability_score,
+        "model_reliability_label": model_reliability_label,
+        "deal_risk_score": deal_risk_score,
+        "deal_risk_label": deal_risk_label,
+        "mileage_note": mileage_note,
+    }
+
+
+def compare_analyzer_to_judge(det: Dict[str, Any], judge: Dict[str, Any]) -> Dict[str, Any]:
+    score = int(det.get("model_reliability_score", 0))
+    j_min = int(judge["expected_score_min"])
+    j_max = int(judge["expected_score_max"])
+    label = det.get("model_reliability_label", "לא ידוע")
+    judge_label = judge["expected_reliability_label"]
+    if score < j_min - 4:
+        drift = "too_pessimistic"
+    elif score > j_max + 4:
+        drift = "too_optimistic"
+    else:
+        drift = "aligned"
+    return {
+        "reliability_drift": drift,
+        "label_match": label == judge_label,
+        "inside_expected_band": j_min <= score <= j_max,
+        "score_gap_vs_band_center": round(score - ((j_min + j_max) / 2.0), 1),
+        "judge_expected_label": judge_label,
+        "judge_expected_range": f"{j_min}-{j_max}",
+    }
+
+
+def read_results() -> List[Dict[str, Any]]:
+    if not RESULTS_PATH.exists():
+        return []
+    rows = []
+    for line in RESULTS_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rows.append(json.loads(line))
+    return rows
+
+
+def write_summary_csv() -> pd.DataFrame:
+    rows = read_results()
+    if not rows:
+        return pd.DataFrame()
+    flat_rows = []
+    for r in rows:
+        det = r.get("deterministic", {})
+        judge = r.get("judge", {})
+        comp = r.get("comparison", {})
+        vehicle = r.get("vehicle", {})
+        flat_rows.append({
+            "run_key": r.get("run_key"),
+            "make": vehicle.get("make"),
+            "model": vehicle.get("model"),
+            "year": vehicle.get("year"),
+            "fuel_type": vehicle.get("fuel_type"),
+            "transmission": vehicle.get("transmission"),
+            "mileage_range": vehicle.get("mileage_range"),
+            "segment": vehicle.get("segment"),
+            "run_idx": r.get("run_idx"),
+            "analyzer_model": r.get("analyzer_model"),
+            "judge_model": r.get("judge_model"),
+            "model_reliability_score": det.get("model_reliability_score"),
+            "model_reliability_label": det.get("model_reliability_label"),
+            "deal_risk_score": det.get("deal_risk_score"),
+            "deal_risk_label": det.get("deal_risk_label"),
+            "overall_reliability_estimate": r.get("analyzer", {}).get("overall_reliability_estimate"),
+            "judge_expected_label": judge.get("expected_reliability_label"),
+            "judge_expected_score_min": judge.get("expected_score_min"),
+            "judge_expected_score_max": judge.get("expected_score_max"),
+            "judge_expected_deal_risk_label": judge.get("expected_deal_risk_label"),
+            "reliability_drift": comp.get("reliability_drift"),
+            "label_match": comp.get("label_match"),
+            "inside_expected_band": comp.get("inside_expected_band"),
+            "score_gap_vs_band_center": comp.get("score_gap_vs_band_center"),
+        })
+    df = pd.DataFrame(flat_rows)
+    df.to_csv(SUMMARY_PATH, index=False, encoding="utf-8-sig")
+    return df
+
+
+def get_remaining_runs(vehicles: List[Dict[str, Any]], runs_per_vehicle: int, progress: Dict[str, Any]) -> List[Tuple[Dict[str, Any], int]]:
+    completed = set(progress.get("completed_runs", []))
+    remaining = []
+    for vehicle in vehicles:
+        for run_idx in range(1, runs_per_vehicle + 1):
+            rk = run_key(vehicle, run_idx)
+            if rk not in completed:
+                remaining.append((vehicle, run_idx))
+    return remaining
+
+
+def process_one_case(
+    client: genai.Client,
+    analyzer_model: str,
+    judge_model: str,
+    vehicle: Dict[str, Any],
+    run_idx: int,
+) -> Dict[str, Any]:
+    analyzer_prompt = build_combined_prompt(vehicle, missing_info=[])
+    analyzer_json, analyzer_grounding = call_grounded_json(client, analyzer_model, analyzer_prompt, AnalyzerResponse)
+    det = compute_reliability_score_and_banner(
+        analyzer_json.get("risk_signals"),
+        analyzer_json.get("overall_reliability_estimate"),
+        model_output=analyzer_json,
+        mileage_range=vehicle.get("mileage_range"),
+    )
+    judge_prompt = build_judge_prompt(vehicle)
+    judge_json, judge_grounding = call_grounded_json(client, judge_model, judge_prompt, JudgeResponse)
+    comp = compare_analyzer_to_judge(det, judge_json)
+    return {
+        "ts": utc_now_iso(),
+        "run_key": run_key(vehicle, run_idx),
+        "run_idx": run_idx,
+        "vehicle": vehicle,
+        "analyzer_model": analyzer_model,
+        "judge_model": judge_model,
+        "analyzer": analyzer_json,
+        "analyzer_grounding_debug": analyzer_grounding,
+        "deterministic": det,
+        "judge": judge_json,
+        "judge_grounding_debug": judge_grounding,
+        "comparison": comp,
+    }
 
 
 def run_batches(
-    source_text: str,
-    model_name: str,
+    vehicles: List[Dict[str, Any]],
+    runs_per_vehicle: int,
     batch_size: int,
+    analyzer_model: str,
+    judge_model: str,
+    pause_seconds: float,
     max_batches: Optional[int],
-    request_pause_seconds: float,
     status_box,
     progress_bar,
     live_placeholder,
 ) -> None:
-    baseline = load_scoring_baseline(source_text)
-    progress = load_progress()
-    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    if "GEMINI_API_KEY" not in st.secrets:
+        st.error("חסר GEMINI_API_KEY ב-secrets של Streamlit.")
+        st.stop()
 
-    remaining = get_remaining_rows(baseline["MODEL_OVERRIDES"], progress)
-    total_target = len(get_vehicle_rows(baseline["MODEL_OVERRIDES"]))
-    processed_before = total_target - len(remaining)
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    progress = load_progress()
+    remaining = get_remaining_runs(vehicles, runs_per_vehicle, progress)
+    total_runs = len(vehicles) * runs_per_vehicle
+    processed_before = total_runs - len(remaining)
     batches_run = 0
 
     while remaining:
         if max_batches is not None and batches_run >= max_batches:
             break
 
-        batch_rows = remaining[:batch_size]
-        status_box.info(
-            f"מעבד אצווה {batches_run + 1} | רכבים באצווה: {len(batch_rows)} | נשארו {len(remaining)} רכבים בלי כיול מלא"
-        )
+        batch_items = remaining[:batch_size]
         live_placeholder.code(
-            "\n".join([f"{r['make']} / {r['model']}" for r in batch_rows]), language="text")
+            "\n".join([
+                f"{v['make']} / {v['model']} / {v['year']} / {v['mileage_range']} / run {run_idx}"
+                for v, run_idx in batch_items
+            ]),
+            language="text",
+        )
+        status_box.info(f"מעבד אצווה {batches_run + 1} | גודל אצווה {len(batch_items)} | נשארו {len(remaining)} ריצות")
 
+        batch_results = []
         batch_started = utc_now_iso()
         try:
-            batch_results, grounding_debug, prompt = call_gemini_batch(client, model_name, batch_rows)
-            merged_keys = merge_batch_into_model_overrides(baseline["MODEL_OVERRIDES"], batch_results)
+            for vehicle, run_idx in batch_items:
+                result = process_one_case(
+                    client=client,
+                    analyzer_model=analyzer_model,
+                    judge_model=judge_model,
+                    vehicle=vehicle,
+                    run_idx=run_idx,
+                )
+                batch_results.append(result)
+                append_jsonl(RESULTS_PATH, result)
+                append_jsonl(LOG_PATH, {
+                    "ts": utc_now_iso(),
+                    "event": "case_success",
+                    "run_key": result["run_key"],
+                    "drift": result["comparison"]["reliability_drift"],
+                })
+                progress["completed_runs"] = sorted(set(progress.get("completed_runs", []) | {result["run_key"]}))
+                save_progress(progress)
 
-            progress["completed"] = sorted(set(progress.get("completed", [])).union(merged_keys))
             progress["last_batch"] = {
                 "started_at": batch_started,
                 "finished_at": utc_now_iso(),
-                "requested": [completed_key(r["make"], r["model"]) for r in batch_rows],
-                "merged": merged_keys,
-                "grounding": grounding_debug,
-                "result_count": len(batch_results),
+                "processed_run_keys": [r["run_key"] for r in batch_results],
+                "batch_size": len(batch_results),
             }
-            progress.setdefault("batch_history", []).append(progress["last_batch"])
+            progress.setdefault("batches", []).append(progress["last_batch"])
             save_progress(progress)
+            df = write_summary_csv()
 
-            output_text = dump_scoring_baseline_module(baseline)
-            save_text(OUTPUT_PATH, output_text)
-
-            append_log(
-                {
-                    "ts": utc_now_iso(),
-                    "event": "batch_success",
-                    "requested": [completed_key(r["make"], r["model"]) for r in batch_rows],
-                    "merged": merged_keys,
-                    "queries": grounding_debug.get("web_search_queries", []),
-                }
-            )
-
+            remaining = get_remaining_runs(vehicles, runs_per_vehicle, progress)
+            processed = total_runs - len(remaining)
+            progress_bar.progress(processed / max(total_runs, 1), text=f"{processed}/{total_runs} ריצות הושלמו")
+            status_box.success(f"האצווה נשמרה. הושלמו {processed} מתוך {total_runs}.")
+            batches_run += 1
+            if pause_seconds > 0 and remaining:
+                time.sleep(pause_seconds)
         except Exception as e:
-            fail_record = {
+            append_jsonl(LOG_PATH, {
                 "ts": utc_now_iso(),
-                "requested": [completed_key(r["make"], r["model"]) for r in batch_rows],
+                "event": "batch_error",
                 "error": str(e),
-            }
-            progress.setdefault("failed", []).append(fail_record)
-            save_progress(progress)
-            append_log({"event": "batch_error", **fail_record})
-            status_box.error(f"שגיאה באצווה הנוכחית: {e}")
+                "traceback": traceback.format_exc(),
+            })
+            status_box.error(f"שגיאה באצווה: {e}")
             break
 
-        batches_run += 1
-        remaining = get_remaining_rows(baseline["MODEL_OVERRIDES"], progress)
-        processed_now = total_target - len(remaining)
-        ratio = processed_now / max(total_target, 1)
-        progress_bar.progress(min(max(ratio, 0.0), 1.0), text=f"{processed_now}/{total_target} רכבים עם כיול מלא")
-        status_box.success(f"האצווה נשמרה. הושלמו עד עכשיו {processed_now} מתוך {total_target}.")
 
-        if request_pause_seconds > 0 and remaining:
-            time.sleep(request_pause_seconds)
-
-    if not remaining:
-        status_box.success("העיבוד הושלם לכל הרכבים שדורשים כיול.")
-
-
-def render_summary(source_text: str) -> None:
-    baseline = load_scoring_baseline(source_text)
-    progress = load_progress()
-    rows = get_vehicle_rows(baseline["MODEL_OVERRIDES"])
-    completed_in_file = sum(1 for row in rows if has_required_fields(row["payload"]))
-    completed_marked = len(set(progress.get("completed", [])))
-    total = len(rows)
-    remaining = len(get_remaining_rows(baseline["MODEL_OVERRIDES"], progress))
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("סה״כ דגמים", total)
-    c2.metric("מלאים בקובץ", completed_in_file)
-    c3.metric("מסומנים כהושלמו", completed_marked)
-    c4.metric("נשארו לעיבוד", remaining)
-
-    last_batch = progress.get("last_batch")
-    if last_batch:
-        st.subheader("האצווה האחרונה")
-        st.json(last_batch, expanded=False)
+def build_metrics(df: pd.DataFrame) -> Dict[str, Any]:
+    if df.empty:
+        return {
+            "runs": 0,
+            "aligned_pct": 0.0,
+            "inside_band_pct": 0.0,
+            "label_match_pct": 0.0,
+            "too_pessimistic_pct": 0.0,
+            "too_optimistic_pct": 0.0,
+        }
+    runs = len(df)
+    return {
+        "runs": runs,
+        "aligned_pct": round((df["reliability_drift"] == "aligned").mean() * 100, 1),
+        "inside_band_pct": round(df["inside_expected_band"].fillna(False).mean() * 100, 1),
+        "label_match_pct": round(df["label_match"].fillna(False).mean() * 100, 1),
+        "too_pessimistic_pct": round((df["reliability_drift"] == "too_pessimistic").mean() * 100, 1),
+        "too_optimistic_pct": round((df["reliability_drift"] == "too_optimistic").mean() * 100, 1),
+    }
 
 
 def main() -> None:
-    st.set_page_config(page_title="Gemini Dictionary Calibrator", layout="wide")
-    st.title("Gemini Grounded Calibration Builder")
-    st.caption("מעדכן את MODEL_OVERRIDES בצורה אוטומטית, עם grounding, checkpoint, resume והורדה של הקובץ המלא.")
+    st.set_page_config(page_title="Reliability Benchmark Lab", layout="wide")
+    st.title("Reliability Benchmark Lab")
+    st.caption("השוואת בודק האמינות מול שופט grounded נפרד, עם שמירה בין ריצות ובלי צורך למלא ידנית 100 דגמים.")
+
+    vehicles = ensure_benchmark_file()
 
     with st.sidebar:
         st.header("הגדרות")
-        model_name = st.text_input("Model", value=DEFAULT_MODEL)
-        batch_size = st.number_input("רכבים בכל בקשה", min_value=1, max_value=20, value=DEFAULT_BATCH_SIZE, step=1)
-        pause_seconds = st.number_input("השהיה בין בקשות (שניות)", min_value=0.0, max_value=10.0, value=0.6, step=0.1)
-        reset_clicked = st.button("איפוס workspace")
+        analyzer_model = st.text_input("Analyzer model", value=DEFAULT_ANALYZER_MODEL)
+        judge_model = st.text_input("Judge model", value=DEFAULT_JUDGE_MODEL)
+        runs_per_vehicle = st.number_input("ריצות לכל רכב", min_value=1, max_value=5, value=2, step=1)
+        batch_size = st.number_input("ריצות בכל אצווה", min_value=1, max_value=20, value=DEFAULT_BATCH_SIZE, step=1)
+        pause_seconds = st.number_input("השהיה בין אצוות", min_value=0.0, max_value=10.0, value=0.5, step=0.1)
+        reset_clicked = st.button("איפוס תוצאות")
         if reset_clicked:
             reset_workspace()
-            st.success("נמחקו source, checkpoint ו-output.")
+            st.success("התוצאות, ה-progress והלוגים נמחקו. רשימת הבנצ'מרק נשמרת.")
+
+        st.markdown("---")
+        uploaded_csv = st.file_uploader("אופציונלי: העלה benchmark CSV מותאם", type=["csv"])
+        if uploaded_csv is not None:
+            df_up = pd.read_csv(uploaded_csv)
+            required_cols = {"make", "model", "year", "fuel_type", "transmission", "mileage_range"}
+            if required_cols.issubset(set(df_up.columns)):
+                records = df_up.fillna("").to_dict(orient="records")
+                save_json(BENCHMARK_PATH, records)
+                st.success(f"נשמרו {len(records)} רכבים לקובץ benchmark.")
+                vehicles = records
+            else:
+                st.error(f"חסרות עמודות חובה: {sorted(required_cols)}")
 
     if "GEMINI_API_KEY" not in st.secrets:
         st.error("חסר GEMINI_API_KEY ב-secrets של Streamlit.")
         st.stop()
 
-    uploaded_file = st.file_uploader("העלה את scoring_baseline.py הקיים", type=["py"])
-    source_text = prepare_source_text(uploaded_file)
-    if not source_text:
-        st.info("צריך להעלות את scoring_baseline.py לפחות פעם אחת. אחר כך אפשר להמשיך גם בלי להעלות שוב באותה סביבת עבודה.")
-        st.stop()
+    progress = load_progress()
+    total_runs = len(vehicles) * int(runs_per_vehicle)
+    remaining = get_remaining_runs(vehicles, int(runs_per_vehicle), progress)
+    completed = total_runs - len(remaining)
 
-    try:
-        render_summary(source_text)
-    except Exception as e:
-        st.error(f"לא הצלחתי לטעון את הקובץ: {e}")
-        st.stop()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("רכבים בסט", len(vehicles))
+    c2.metric("ריצות כוללות", total_runs)
+    c3.metric("הושלמו", completed)
+    c4.metric("נשארו", len(remaining))
+
+    st.subheader("קטעי benchmark")
+    seg_df = pd.DataFrame(vehicles)
+    if "segment" in seg_df.columns:
+        st.dataframe(seg_df["segment"].value_counts().rename_axis("segment").reset_index(name="count"), use_container_width=True)
 
     status_box = st.empty()
-    progress_bar = st.progress(0.0, text="מוכן להתחלה")
+    progress_bar = st.progress(completed / max(total_runs, 1), text=f"{completed}/{total_runs} ריצות הושלמו")
     live_placeholder = st.empty()
-
-    progress = load_progress()
-    baseline = load_scoring_baseline(source_text)
-    total = len(get_vehicle_rows(baseline["MODEL_OVERRIDES"]))
-    remaining = len(get_remaining_rows(baseline["MODEL_OVERRIDES"], progress))
-    progress_bar.progress((total - remaining) / max(total, 1), text=f"{total - remaining}/{total} רכבים עם כיול מלא")
 
     col1, col2, col3 = st.columns(3)
     run_one = col1.button("הרץ אצווה אחת")
@@ -476,11 +1200,13 @@ def main() -> None:
 
     if run_one:
         run_batches(
-            source_text=source_text,
-            model_name=model_name,
+            vehicles=vehicles,
+            runs_per_vehicle=int(runs_per_vehicle),
             batch_size=int(batch_size),
+            analyzer_model=analyzer_model,
+            judge_model=judge_model,
+            pause_seconds=float(pause_seconds),
             max_batches=1,
-            request_pause_seconds=float(pause_seconds),
             status_box=status_box,
             progress_bar=progress_bar,
             live_placeholder=live_placeholder,
@@ -488,11 +1214,13 @@ def main() -> None:
 
     if run_all:
         run_batches(
-            source_text=source_text,
-            model_name=model_name,
+            vehicles=vehicles,
+            runs_per_vehicle=int(runs_per_vehicle),
             batch_size=int(batch_size),
+            analyzer_model=analyzer_model,
+            judge_model=judge_model,
+            pause_seconds=float(pause_seconds),
             max_batches=None,
-            request_pause_seconds=float(pause_seconds),
             status_box=status_box,
             progress_bar=progress_bar,
             live_placeholder=live_placeholder,
@@ -501,39 +1229,75 @@ def main() -> None:
     if refresh_only:
         st.rerun()
 
-    if OUTPUT_PATH.exists():
+    df = write_summary_csv()
+    st.subheader("מדדי כיול")
+    metrics = build_metrics(df)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Aligned %", metrics["aligned_pct"])
+    m2.metric("Inside band %", metrics["inside_band_pct"])
+    m3.metric("Label match %", metrics["label_match_pct"])
+    m4.metric("Too pessimistic %", metrics["too_pessimistic_pct"])
+    m5.metric("Too optimistic %", metrics["too_optimistic_pct"])
+
+    if not df.empty:
+        st.subheader("פירוק לפי segment")
+        if "segment" in df.columns:
+            seg_view = (
+                df.groupby("segment", dropna=False)
+                .agg(
+                    runs=("run_key", "count"),
+                    avg_score=("model_reliability_score", "mean"),
+                    aligned_pct=("inside_expected_band", lambda s: round(s.fillna(False).mean() * 100, 1)),
+                    too_pessimistic_pct=("reliability_drift", lambda s: round((s == "too_pessimistic").mean() * 100, 1)),
+                    too_optimistic_pct=("reliability_drift", lambda s: round((s == "too_optimistic").mean() * 100, 1)),
+                )
+                .reset_index()
+            )
+            st.dataframe(seg_view, use_container_width=True)
+
+        st.subheader("תוצאות")
+        st.dataframe(df.sort_values(["make", "model", "year", "run_idx"]), use_container_width=True, height=500)
+
+    if SUMMARY_PATH.exists():
         st.download_button(
-            "הורד scoring_baseline_calibrated.py",
-            data=OUTPUT_PATH.read_bytes(),
-            file_name="scoring_baseline_calibrated.py",
-            mime="text/x-python",
+            "הורד summary CSV",
+            data=SUMMARY_PATH.read_bytes(),
+            file_name="benchmark_summary.csv",
+            mime="text/csv",
             use_container_width=True,
         )
-
+    if RESULTS_PATH.exists():
+        st.download_button(
+            "הורד raw results JSONL",
+            data=RESULTS_PATH.read_bytes(),
+            file_name="benchmark_results.jsonl",
+            mime="application/json",
+            use_container_width=True,
+        )
     if PROGRESS_PATH.exists():
         st.download_button(
-            "הורד checkpoint progress.json",
+            "הורד progress JSON",
             data=PROGRESS_PATH.read_bytes(),
-            file_name="calibration_progress.json",
+            file_name="benchmark_progress.json",
             mime="application/json",
             use_container_width=True,
         )
 
+    with st.expander("קוד הלוגיקה שמוטמע כאן"):
+        st.markdown("""
+הקובץ כולל:
+- prompt grounded לבודק, לפי מבנה `build_combined_prompt`
+- Google Search tool דרך `google.genai.types.Tool(google_search=types.GoogleSearch())`
+- לוגיקת ניקוד דטרמיניסטית לפי `compute_reliability_score_and_banner`
+- `mileage_adjustment`
+- שמירת workspace בין ריצות (`progress`, `results`, `summary`, `log`)
+- שופט LLM נפרד בלי הלוגיקה הדטרמיניסטית
+- השוואת drift: aligned / too_pessimistic / too_optimistic
+        """)
+
     if LOG_PATH.exists():
         with st.expander("Run log"):
             st.code(LOG_PATH.read_text(encoding="utf-8"), language="json")
-
-    with st.expander("מה האפליקציה עושה"):
-        st.markdown(
-            """
-            - שומרת עותק מקומי של `scoring_baseline.py`.
-            - עוברת רק על דגמים שחסרים להם שדות הכיול החדשים.
-            - שולחת אצוות ל-Gemini עם Google Search grounding ו-JSON schema.
-            - שומרת checkpoint אחרי כל אצווה מוצלחת.
-            - כותבת קובץ Python מלא ומעודכן אחרי כל אצווה.
-            - אם יש נפילה/timeout, פשוט לוחצים שוב המשך והעיבוד ממשיך מהמקום האחרון שנשמר.
-            """
-        )
 
 
 if __name__ == "__main__":
