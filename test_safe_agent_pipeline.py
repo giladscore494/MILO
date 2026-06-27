@@ -200,3 +200,138 @@ def test_if_enrichment_agent_fails_final_status_becomes_partial():
     with patch("app.run_safe_agent", side_effect=fake_safe):
         result = app.run_final_builder_phase("key", {}, {}, {}, [{"agent": "engines", "error": "INVALID_JSON"}], "Hyundai", "Israel", "2010-2026")
     assert result["parsed"]["status"] == "partial"
+
+
+def test_technical_json_missing_agent_is_repaired_from_agent_name():
+    checked = app.validate_model_response(
+        fake_result('{"items":[],"missing_data":[],"extra_candidate_models":[]}', agent="trims_years_agent", phase="technical"),
+        require_json=True,
+        required_keys=["agent", "items", "missing_data", "extra_candidate_models"],
+        validator=app.validate_items_schema,
+    )
+    assert checked["parsed"]["agent"] == "trims_years_agent"
+    assert "agent" in checked["repaired_fields"]
+
+
+def test_technical_json_missing_items_still_fails():
+    checked = app.validate_model_response(
+        fake_result('{"missing_data":[],"extra_candidate_models":[]}', agent="trims_years_agent", phase="technical"),
+        require_json=True,
+        required_keys=["agent", "items", "missing_data", "extra_candidate_models"],
+        validator=app.validate_items_schema,
+    )
+    assert checked["_error"] == "MISSING_REQUIRED_KEY:items"
+
+
+def test_technical_json_missing_optional_lists_default_to_empty():
+    checked = app.validate_model_response(
+        fake_result('{"agent":"engines_fuel_power_agent","items":[]}', agent="engines_fuel_power_agent", phase="technical"),
+        require_json=True,
+        required_keys=["agent", "items", "missing_data", "extra_candidate_models"],
+        validator=app.validate_items_schema,
+    )
+    assert checked["parsed"]["missing_data"] == []
+    assert checked["parsed"]["extra_candidate_models"] == []
+
+
+def test_required_keys_are_validated_against_parsed_not_wrapper(monkeypatch):
+    def fake_chat(*args, **kwargs):
+        return fake_result('{"items":[],"missing_data":[],"extra_candidate_models":[]}', agent="engines_fuel_power_agent", phase="technical")
+
+    monkeypatch.setattr(app, "moonshot_chat", fake_chat)
+    result = app.run_safe_agent(
+        "key", agent_name="engines_fuel_power_agent", phase_name="technical", prompt=[{"role": "user", "content": "x"}],
+        max_tokens=20, required_top_keys=["agent", "items", "missing_data", "extra_candidate_models"], validator=app.validate_items_schema,
+    )
+    assert result["status"] == "success"
+    assert result["agent"] == "engines_fuel_power_agent"
+    assert result["parsed"]["agent"] == "engines_fuel_power_agent"
+
+
+def test_chunk_merge_includes_agent_at_wrapper_and_parsed_levels():
+    merged = app.merge_chunk_results("engines_fuel_power_agent", [app.phase_result(status="success", agent="engines_fuel_power_agent", parsed={"items": [], "missing_data": [], "extra_candidate_models": []})])
+    assert merged["agent"] == "engines_fuel_power_agent"
+    assert merged["parsed"]["agent"] == "engines_fuel_power_agent"
+
+
+def test_fallback_prompt_for_each_technical_agent_includes_agent():
+    for agent in app.TECHNICAL_AGENTS:
+        prompt_text = "\n".join(m["content"] for m in app.technical_fallback_prompt(agent))
+        assert f'"agent": "{agent.key}"' in prompt_text
+
+
+def test_verifier_input_excludes_raw_preview_and_raw_failed_text():
+    compact = app.compact_verifier_input(
+        {"canonical_models": [{"canonical_model_name": "i10", "sources": ["u"]}]},
+        {"a": {"agent": "a", "items": [{"model": "i10", "sources": ["u"], "notes": "raw notes"}], "missing_data": [], "extra_candidate_models": []}},
+        [{"agent": "a", "error": "INVALID_JSON", "raw_preview": "SECRET_RAW", "message": "safe"}],
+    )
+    text = json.dumps(compact, ensure_ascii=False)
+    assert "raw_preview" not in text
+    assert "SECRET_RAW" not in text
+    assert "INVALID_JSON" in text
+
+
+def test_verifier_chunks_large_model_lists(monkeypatch):
+    calls = []
+
+    def fake_safe(*args, **kwargs):
+        calls.append(kwargs["prompt"])
+        return app.phase_result(status="success", agent="source_verifier", parsed={"agent": "source_verifier", "verified_models": [], "rejected_data_points": [], "needs_review": []})
+
+    monkeypatch.setattr(app, "run_safe_agent", fake_safe)
+    normalized = {"canonical_models": [{"canonical_model_name": f"m{i}", "sources": []} for i in range(app.VERIFIER_MODEL_CHUNK_SIZE + 1)]}
+    result = app.run_verification_phase("key", normalized, {})
+    assert result["status"] == "success"
+    assert len(calls) == 2
+
+
+def test_verifier_truncated_one_chunk_produces_partial_if_other_chunks_succeed(monkeypatch):
+    responses = [
+        app.phase_result(status="failed", agent="source_verifier", error="MODEL_JSON_TRUNCATED"),
+        app.phase_result(status="success", agent="source_verifier", parsed={"agent": "source_verifier", "verified_models": [{"model": "m"}], "rejected_data_points": [], "needs_review": []}),
+    ]
+
+    def fake_safe(*args, **kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr(app, "run_safe_agent", fake_safe)
+    normalized = {"canonical_models": [{"canonical_model_name": f"m{i}", "sources": []} for i in range(app.VERIFIER_MODEL_CHUNK_SIZE + 1)]}
+    result = app.run_verification_phase("key", normalized, {})
+    assert result["status"] == "partial"
+    assert result["parsed"]["agent"] == "source_verifier"
+    assert result["parsed"]["verified_models"] == [{"model": "m"}]
+
+
+def test_if_all_technical_agents_fail_verifier_and_final_builder_do_not_run(monkeypatch):
+    events = []
+
+    class FakeSessionState(dict):
+        def __getattr__(self, name):
+            return self[name]
+        def __setattr__(self, name, value):
+            self[name] = value
+
+    class FakeSt:
+        def __init__(self):
+            self.session_state = FakeSessionState()
+        def subheader(self, text): events.append(("subheader", text))
+        def write(self, text): pass
+        def code(self, *args, **kwargs): pass
+        def success(self, text): pass
+        def warning(self, text): events.append(("warning", text))
+        def error(self, text): events.append(("error", text))
+
+    fake_st = FakeSt()
+    fake_st.session_state.results = {}
+    fake_st.session_state.input_tokens = 0
+    fake_st.session_state.output_tokens = 0
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "run_discovery_phase", lambda *args: [app.phase_result(status="success", agent="d", parsed={"agent":"d","manufacturer":"Hyundai","market":"Israel","period":"p","models":[{"model_name_en":"i10","source_url":"u"}]})])
+    monkeypatch.setattr(app, "run_normalizer_phase", lambda *args: app.phase_result(status="success", agent="normalizer_deduper", parsed={"agent":"normalizer_deduper","canonical_models":[{"canonical_model_name":"i10","sources":["u"]}],"rejected_items":[],"needs_review":[]}))
+    monkeypatch.setattr(app, "run_technical_enrichment_phase", lambda *args: [app.phase_result(status="failed", agent=a.key, error="INVALID_JSON") for a in app.TECHNICAL_AGENTS])
+    monkeypatch.setattr(app, "run_verification_phase", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("verifier should not run")))
+    monkeypatch.setattr(app, "run_final_builder_phase", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("final builder should not run")))
+
+    app.run_pipeline("key", "Hyundai", "Israel", "p")
+    assert ("error", "Pipeline failed: TECHNICAL_ENRICHMENT_FAILED\nReason: all technical enrichment agents failed.") in events

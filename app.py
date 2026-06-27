@@ -27,6 +27,7 @@ MAX_DISCOVERY_TOKENS = 1800
 MAX_DISCOVERY_FALLBACK_TOKENS = 1200
 MAX_TECHNICAL_AGENT_TOKENS = 2500
 MAX_VERIFIER_TOKENS = 3500
+VERIFIER_MODEL_CHUNK_SIZE = 12
 MAX_FINAL_BUILDER_TOKENS = 4500
 MAX_SUMMARY_TOKENS = 1200
 RAW_DEBUG_PREVIEW_CHARS = 2000
@@ -205,6 +206,17 @@ def validate_model_response(
         parsed, parse_error = _parse_json_strict(content)
         if parse_error or (isinstance(parsed, dict) and "_raw_text" in parsed):
             return _error_payload("INVALID_JSON", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
+        repaired_fields: List[str] = []
+        if phase == "technical" and isinstance(parsed, dict):
+            if "agent" not in parsed:
+                parsed["agent"] = agent
+                repaired_fields.append("agent")
+            if "missing_data" not in parsed:
+                parsed["missing_data"] = []
+                repaired_fields.append("missing_data")
+            if "extra_candidate_models" not in parsed:
+                parsed["extra_candidate_models"] = []
+                repaired_fields.append("extra_candidate_models")
         if required_keys and isinstance(parsed, dict):
             for key in required_keys:
                 if key not in parsed:
@@ -221,6 +233,8 @@ def validate_model_response(
                 return payload
         ok = dict(result)
         ok["parsed"] = parsed
+        if repaired_fields:
+            ok["repaired_fields"] = repaired_fields
         return ok
     return dict(result)
 
@@ -598,13 +612,6 @@ Responsibility: {agent.responsibility}
 Return exactly this schema shape: {schema_by_agent[agent.key]}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
-def verifier_prompt(normalized: Any, technical: Dict[str, Any]) -> List[Dict[str, str]]:
-    return [
-        {"role": "system", "content": "You are source_verifier. JSON only. No broad new research. Review existing structured JSON only; do not invent missing data. If sources are only global or foreign-market, mark needs_review rather than verified."},
-        {"role": "user", "content": "Verify Israel-market relevance, model-vs-trim status, contradictions, unsupported data, source_region, and source_strength. Return schema {\"agent\":\"source_verifier\",\"verified_models\":[{\"model\":\"string\",\"status\":\"verified|partial|needs_review|rejected\",\"confidence\":\"high|medium|low\",\"issues\":[\"string\"],\"source_region\":\"israel|global|foreign_market|unknown\",\"source_strength\":\"official_israel|israeli_auto_portal|used_market|global_official|foreign_market|weak|unknown\"}],\"rejected_data_points\":[{\"model\":\"string\",\"field\":\"string\",\"value\":\"string\",\"reason\":\"source_not_israel|conflict|trim_not_model|unsupported|global_only\"}],\"needs_review\":[{\"model\":\"string\",\"reason\":\"string\"}]}.\nNormalized:\n" + json.dumps(normalized, ensure_ascii=False, indent=2) + "\nTechnical:\n" + json.dumps(technical, ensure_ascii=False, indent=2)},
-    ]
-
-
 def final_builder_prompt(normalized: Any, technical: Dict[str, Any], verifier: Any, failed_summaries: List[Dict[str, Any]], manufacturer: str, market: str, period: str) -> List[Dict[str, str]]:
     return [
         {"role": "system", "content": f"You are final_builder. JSON only. No web search. Build final JSON from clean structured inputs only. Never invent facts.\n{CONSOLIDATION_CONTEXT}"},
@@ -817,9 +824,48 @@ def technical_max_tokens(agent_key: str) -> int:
     return 2500 if agent_key == "trims_years_agent" else 3000
 
 
+def technical_fallback_prompt(agent: AgentConfig) -> List[Dict[str, str]]:
+    empty_schema = {"agent": agent.key, "items": [], "missing_data": [], "extra_candidate_models": []}
+    task = "trims and years" if agent.key == "trims_years_agent" else "your assigned automotive facts"
+    return [
+        {"role": "system", "content": MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Return compact JSON only. No explanation."},
+        {"role": "user", "content": f"Return compact JSON only for {task}. Required top-level schema, including the agent key: " + json.dumps(empty_schema, ensure_ascii=False)},
+    ]
+
+
 def run_technical_agent(api_key: str, agent: AgentConfig, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> Dict[str, Any]:
-    fallback = [{"role": "system", "content": MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Return compact JSON only. No explanation."}, {"role": "user", "content": "Return compact JSON only for trims and years. No explanation." if agent.key == "trims_years_agent" else "Return compact JSON only for your assigned automotive facts. No explanation."}]
+    fallback = technical_fallback_prompt(agent)
     return run_safe_agent(api_key, agent_name=agent.key, phase_name="technical", prompt=technical_prompt(agent, manufacturer, market, period, canonical_models), max_tokens=technical_max_tokens(agent.key), required_top_keys=["agent", "items", "missing_data", "extra_candidate_models"], fallback_prompt=fallback, allow_partial=True, use_web_search=True, validator=validate_items_schema)
+
+
+def merge_chunk_results(agent_name: str, chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    parsed = {"agent": agent_name, "items": [], "missing_data": [], "extra_candidate_models": []}
+    failed_chunks = []
+    input_tokens = output_tokens = 0
+    for result in chunk_results:
+        input_tokens += result.get("input_tokens", 0)
+        output_tokens += result.get("output_tokens", 0)
+        if result.get("status") not in {"success", "partial"}:
+            failed_chunks.append({"agent": result.get("agent", agent_name), "error": result.get("error")})
+            continue
+        data = result.get("parsed") or {}
+        parsed["agent"] = data.get("agent", agent_name) if isinstance(data, dict) else agent_name
+        if isinstance(data, dict):
+            for key in ("items", "missing_data", "extra_candidate_models"):
+                if isinstance(data.get(key), list):
+                    parsed[key].extend(data[key])
+    status = "success" if not failed_chunks else ("partial" if parsed["items"] or parsed["missing_data"] or parsed["extra_candidate_models"] else "failed")
+    return {
+        "status": status,
+        "agent": agent_name,
+        "phase": "technical_enrichment",
+        "parsed": parsed,
+        "error": None if status != "failed" else "TECHNICAL_CHUNKS_FAILED",
+        "failed_chunks": failed_chunks,
+        "token_usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
 
 
 def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -827,8 +873,69 @@ def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str,
     return [run_technical_agent(api_key, a, manufacturer, market, period, canonical_models) for a in TECHNICAL_AGENTS]
 
 
-def run_verification_phase(api_key: str, normalized: Any, technical: Dict[str, Any]) -> Dict[str, Any]:
-    return run_safe_agent(api_key, agent_name="source_verifier", phase_name="verification", prompt=verifier_prompt(normalized, technical), max_tokens=MAX_VERIFIER_TOKENS, required_top_keys=["agent", "verified_models", "rejected_data_points", "needs_review"], use_web_search=False, validator=validate_verifier_schema)
+def compact_verifier_input(normalized: Any, technical: Dict[str, Any], failed_summaries: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    canonical_models = []
+    for model in (normalized or {}).get("canonical_models", []) if isinstance(normalized, dict) else []:
+        if isinstance(model, dict):
+            canonical_models.append({
+                "canonical_model_name": model.get("canonical_model_name"),
+                "model_name_he": model.get("model_name_he"),
+                "sources": model.get("sources", []),
+            })
+    technical_summaries: Dict[str, Any] = {}
+    for agent, parsed in (technical or {}).items():
+        if not isinstance(parsed, dict):
+            continue
+        items = []
+        for item in parsed.get("items", []):
+            if isinstance(item, dict):
+                items.append({"model": item.get("model"), "confidence": item.get("confidence"), "sources": item.get("sources", []), "fields": sorted(k for k, v in item.items() if k not in {"sources", "notes"} and v not in (None, "", [], {}))})
+        technical_summaries[agent] = {"agent": parsed.get("agent", agent), "items": items, "missing_data_count": len(parsed.get("missing_data", [])), "extra_candidate_models_count": len(parsed.get("extra_candidate_models", []))}
+    return {"canonical_models": canonical_models, "technical_summaries": technical_summaries, "failed_summaries": compact_failed_summaries(failed_summaries or [])}
+
+
+def verifier_prompt(normalized: Any, technical: Dict[str, Any], failed_summaries: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, str]]:
+    compact_input = compact_verifier_input(normalized, technical, failed_summaries)
+    return [
+        {"role": "system", "content": "You are source_verifier. JSON only. No broad new research. Review existing compact structured JSON only; do not invent missing data. If sources are only global or foreign-market, mark needs_review rather than verified."},
+        {"role": "user", "content": "Verify Israel-market relevance, model-vs-trim status, contradictions, unsupported data, source_region, and source_strength. Return schema {\"agent\":\"source_verifier\",\"verified_models\":[],\"rejected_data_points\":[],\"needs_review\":[]} with compact objects in those lists. Compact input:\n" + json.dumps(compact_input, ensure_ascii=False, indent=2)},
+    ]
+
+
+def _chunk_models(normalized: Any, chunk_size: int = VERIFIER_MODEL_CHUNK_SIZE) -> List[Dict[str, Any]]:
+    models = (normalized or {}).get("canonical_models", []) if isinstance(normalized, dict) else []
+    if not models:
+        return [normalized]
+    chunks = []
+    for i in range(0, len(models), chunk_size):
+        chunk = dict(normalized)
+        chunk["canonical_models"] = models[i:i + chunk_size]
+        chunks.append(chunk)
+    return chunks
+
+
+def merge_verifier_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    parsed = {"agent": "source_verifier", "verified_models": [], "rejected_data_points": [], "needs_review": []}
+    failed = []
+    input_tokens = output_tokens = 0
+    for result in results:
+        input_tokens += result.get("input_tokens", 0)
+        output_tokens += result.get("output_tokens", 0)
+        if result.get("status") not in {"success", "partial"}:
+            failed.append({"agent": result.get("agent"), "error": result.get("error")})
+            continue
+        data = result.get("parsed") or {}
+        for key in ("verified_models", "rejected_data_points", "needs_review"):
+            if isinstance(data.get(key), list):
+                parsed[key].extend(data[key])
+    status = "success" if not failed else ("partial" if any(r.get("status") in {"success", "partial"} for r in results) else "failed")
+    return {"status": status, "agent": "source_verifier", "phase": "verification", "parsed": parsed if status != "failed" else None, "error": "VERIFIER_CHUNK_FAILED" if status == "partial" else ("VERIFIER_FAILED" if status == "failed" else None), "failed_chunks": failed, "input_tokens": input_tokens, "output_tokens": output_tokens}
+
+
+def run_verification_phase(api_key: str, normalized: Any, technical: Dict[str, Any], failed_summaries: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    chunks = _chunk_models(normalized)
+    results = [run_safe_agent(api_key, agent_name="source_verifier", phase_name="verification", prompt=verifier_prompt(chunk, technical, failed_summaries), max_tokens=MAX_VERIFIER_TOKENS, required_top_keys=["agent", "verified_models", "rejected_data_points", "needs_review"], use_web_search=False, validator=validate_verifier_schema) for chunk in chunks]
+    return merge_verifier_results(results)
 
 
 def compact_failed_summaries(failed_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -892,22 +999,30 @@ def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> N
     for r in technical_results:
         add_tokens(r)
         st.write(f"{r['agent']}: {r['status']}" + (f" — {r['error']}" if r.get("error") else ""))
-        if r["status"] == "success":
+        if r["status"] in {"success", "partial"} and isinstance(r.get("parsed"), dict):
             technical_clean[r["agent"]] = r["parsed"]
         else:
             failed_summaries.append({"agent": r["agent"], "error": r["error"], "message": r.get("message", "")})
     st.session_state.results["technical_enrichment_phase"] = technical_results
 
+    if not technical_clean:
+        st.error("Pipeline failed: TECHNICAL_ENRICHMENT_FAILED\nReason: all technical enrichment agents failed.")
+        return
+
     st.subheader("Phase 4 — verifier")
-    verifier = run_verification_phase(api_key, normalizer["parsed"], technical_clean)
+    verifier = run_verification_phase(api_key, normalizer["parsed"], technical_clean, failed_summaries)
     add_tokens(verifier)
     st.session_state.results["source_verifier"] = verifier
-    if verifier["status"] != "success":
+    if verifier["status"] == "success":
+        verifier_data = verifier["parsed"]
+    elif verifier["status"] == "partial" and isinstance(verifier.get("parsed"), dict):
+        failed_summaries.append({"agent": "source_verifier", "error": verifier["error"], "message": verifier.get("message", "")})
+        verifier_data = verifier["parsed"]
+        st.warning(f"Verifier partially failed: {verifier['error']}; continuing partial.")
+    else:
         failed_summaries.append({"agent": "source_verifier", "error": verifier["error"], "message": verifier.get("message", "")})
         verifier_data = {"agent": "source_verifier", "verified_models": [], "rejected_data_points": [], "needs_review": [{"model": "*", "reason": verifier["error"]}]}
         st.warning(f"Verifier failed: {verifier['error']}; continuing partial.")
-    else:
-        verifier_data = verifier["parsed"]
 
     st.subheader("Phase 5 — final builder")
     final = run_final_builder_phase(api_key, normalizer["parsed"], technical_clean, verifier_data, failed_summaries, manufacturer, market, period)
