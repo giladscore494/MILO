@@ -26,6 +26,11 @@ DEFAULT_MARKET = "Israel"
 DEFAULT_PERIOD = "2010 to June 2026"
 
 WEB_SEARCH_TOOL = [{"type": "builtin_function", "function": {"name": "$web_search"}}]
+MANDATORY_WEB_SEARCH_INSTRUCTION = (
+    "IMPORTANT: You MUST call the $web_search tool to find information. "
+    "Do NOT answer from memory. Do NOT describe what you plan to search. "
+    "Execute the search immediately.\n\n"
+)
 
 ARCHITECTURE_ASCII = """
 Phase 1A: Discovery (serial, web)
@@ -163,8 +168,10 @@ def moonshot_chat(
     total_output = 0
     finish_reason = None
     content = ""
+    rounds = 0
 
-    for _ in range(MAX_TOOL_ROUNDS):
+    while finish_reason not in ("stop", "length") and rounds < MAX_TOOL_ROUNDS:
+        rounds += 1
         kwargs: Dict[str, Any] = {
             "model": KIMI_MODEL,
             "messages": history,
@@ -201,6 +208,52 @@ def moonshot_chat(
         if finish_reason in {"stop", "length"}:
             break
 
+    # Retry if agent talked about searching but never actually searched.
+    if use_web_search and rounds <= 2 and finish_reason == "stop" and not any(
+        m.get("role") == "tool" for m in history if isinstance(m, dict)
+    ):
+        history.append({
+            "role": "user",
+            "content": "You did not use the $web_search tool. You MUST search the web now. Do not describe what to search — call the tool directly.",
+        })
+        finish_reason = None
+        while finish_reason not in ("stop", "length") and rounds < MAX_TOOL_ROUNDS:
+            rounds += 1
+            kwargs = {
+                "model": KIMI_MODEL,
+                "messages": history,
+                "temperature": temperature,
+                "extra_body": {"thinking": {"type": "disabled"}},
+                "tools": WEB_SEARCH_TOOL,
+            }
+            if response_format:
+                kwargs["response_format"] = response_format
+
+            response = client.chat.completions.create(**kwargs)
+            in_tokens, out_tokens = _usage_tokens(response)
+            total_input += in_tokens
+            total_output += out_tokens
+
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            message = choice.message
+            content = _message_content(message)
+
+            if finish_reason == "tool_calls":
+                history.append(message.model_dump(exclude_none=True))
+                for tool_call in message.tool_calls or []:
+                    args = json.loads(tool_call.function.arguments or "{}")
+                    history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "content": json.dumps(args, ensure_ascii=False),
+                    })
+                continue
+
+            if finish_reason in {"stop", "length"}:
+                break
+
     return {
         "content": content,
         "finish_reason": finish_reason,
@@ -211,7 +264,7 @@ def moonshot_chat(
 
 
 def discovery_prompt(manufacturer: str, market: str, period: str) -> List[Dict[str, str]]:
-    system = f"""You are Agent 1A, an autonomous vehicle-model discovery researcher.
+    system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"""You are Agent 1A, an autonomous vehicle-model discovery researcher.
 {ISRAEL_DISCOVERY_CONTEXT}
 Return ONLY a valid JSON array. Each item must include: model_name_en, model_name_he, body_type, years_sold, currently_sold, generations.
 Do not include markdown or explanations. Discover all relevant models through web search at runtime."""
@@ -224,7 +277,7 @@ Return ONLY the JSON array."""
 
 
 def enrichment_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, model_list: str) -> List[Dict[str, str]]:
-    system = f"""You are {agent.name}, an Israeli-market automotive data enrichment researcher.
+    system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"""You are {agent.name}, an Israeli-market automotive data enrichment researcher.
 {ISRAEL_ENRICHMENT_CONTEXT}
 ONLY research models in the provided list — do not add models.
 Output ONLY a valid JSON array. No markdown, no explanations."""
