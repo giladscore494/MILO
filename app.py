@@ -19,11 +19,12 @@ KIMI_MODEL = "kimi-k2.6"
 SEARCH_TEMPERATURE = 0.6
 CONSOLIDATION_TEMPERATURE = 0.6
 MAX_TOOL_ROUNDS = 15
-MAX_DISCOVERY_TOKENS = 1800
-MAX_ENRICHMENT_TOKENS = 3000
-MAX_CONSOLIDATION_TOKENS = 5000
+MAX_DISCOVERY_TOKENS = 1600
+MAX_DISCOVERY_FALLBACK_TOKENS = 1200
+MAX_TECHNICAL_AGENT_TOKENS = 2500
+MAX_VERIFIER_TOKENS = 3500
+MAX_FINAL_BUILDER_TOKENS = 4500
 MAX_SUMMARY_TOKENS = 1200
-DISCOVERY_RETRY_TOKENS = 1200
 RAW_DEBUG_PREVIEW_CHARS = 2000
 MAX_REASONABLE_OUTPUT_CHARS = 120_000
 INPUT_COST_PER_1M = 0.95
@@ -40,19 +41,16 @@ MANDATORY_WEB_SEARCH_INSTRUCTION = (
 )
 
 ARCHITECTURE_ASCII = """
-Phase 1A: Discovery (serial, web)
+Phase 1: Discovery (3 focused web agents)
           |
           v
-Phase 1B: Enrichment (5 parallel web agents)
-  +-------+-------+-------+-------+-------+
-  |Trim   |Engine |Trans. |Dim/Saf|Equip. |
-  +-------+-------+-------+-------+-------+
+Phase 2: Python merge + normalizer
           |
           v
-Phase 2: Consolidation (serial, no web)
+Phase 3: Technical enrichment (4 focused web agents)
           |
           v
-Phase 3: Hebrew Summary (serial, no web)
+Phase 4: Verifier -> Final builder -> Hebrew summary
 """
 
 ISRAEL_DISCOVERY_CONTEXT = """
@@ -91,12 +89,17 @@ class AgentConfig:
     responsibility: str
 
 
-ENRICHMENT_AGENTS: List[AgentConfig] = [
-    AgentConfig("agent_2_trims", "Agent 2", "Trim levels per model", "For each provided model, research Israeli-market trim levels: trim name, years available, and base price in ILS if found."),
-    AgentConfig("agent_3_powertrain", "Agent 3", "Engine & drivetrain", "For each provided model, research Israeli-market powertrain specs: displacement, cylinders, HP, torque, fuel type, drivetrain, battery capacity and range for EVs."),
-    AgentConfig("agent_4_performance", "Agent 4", "Transmission & performance", "For each provided model, research Israeli-market transmission and performance: gearbox type/speeds, 0-100 km/h, top speed, city/highway/combined fuel consumption in l/100km."),
-    AgentConfig("agent_5_dimensions_safety", "Agent 5", "Dimensions & safety", "For each provided model, research Israeli-market dimensions and safety: L/W/H/wheelbase/trunk/weight, Euro NCAP, airbags, and ADAS feature list."),
-    AgentConfig("agent_6_equipment", "Agent 6", "Equipment", "For each provided model, research Israeli-market equipment: infotainment, connectivity, comfort features, exterior features, and interior material."),
+DISCOVERY_AGENTS: List[AgentConfig] = [
+    AgentConfig("current_official_lineup_agent", "Current official lineup", "Current official/importer models", "Find currently sold models from official importer / official Israel sources."),
+    AgentConfig("historical_used_market_agent", "Historical used market", "Historical used-car/model-list models", "Find historical models sold in Israel using Israeli used-car/model-listing/price-list sources."),
+    AgentConfig("ev_hybrid_edge_cases_agent", "EV/hybrid edge cases", "EV, hybrid, and special models", "Find EV, hybrid, and special models that generic searches may miss."),
+]
+
+TECHNICAL_AGENTS: List[AgentConfig] = [
+    AgentConfig("trims_years_agent", "Trims & years", "Israeli trims and years", "Collect Israeli trims / versions, approximate years sold, and generation labels when known."),
+    AgentConfig("engines_fuel_power_agent", "Engines, fuel & power", "Powertrain facts", "Collect engine displacement, fuel type, hybrid/EV details, power hp, and torque when available."),
+    AgentConfig("transmission_drivetrain_performance_agent", "Transmission & performance", "Transmission/drivetrain/performance", "Collect transmission type, drivetrain, 0-100 when available, and notable gearbox notes."),
+    AgentConfig("dimensions_safety_equipment_agent", "Dimensions, safety & equipment", "Dimensions/safety/equipment", "Collect body type, seats, trunk volume, dimensions, safety rating/systems, and key common equipment."),
 ]
 
 
@@ -111,6 +114,7 @@ PLANNING_LOOP_LIMITS: Tuple[Tuple[str, int], ...] = (
     ("I should also search", 5),
     ("I'll also search", 5),
     ("search again with different queries", 2),
+    ("more targeted queries", 3),
 )
 
 
@@ -140,9 +144,11 @@ def _parse_json_strict(content: str) -> Tuple[Optional[Any], Optional[str]]:
         return None, "INVALID_JSON"
 
 
-def _error_payload(error: str, finish_reason: Any, input_tokens: int, output_tokens: int, content: str) -> Dict[str, Any]:
+def _error_payload(error: str, finish_reason: Any, input_tokens: int, output_tokens: int, content: str, *, agent: str = "", phase: str = "") -> Dict[str, Any]:
     return {
         "_error": error,
+        "agent": agent,
+        "phase": phase,
         "finish_reason": finish_reason,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -150,30 +156,140 @@ def _error_payload(error: str, finish_reason: Any, input_tokens: int, output_tok
     }
 
 
-def validate_model_response(result: Dict[str, Any], *, require_json: bool, validator: Optional[Any] = None) -> Dict[str, Any]:
+def validate_model_response(
+    result: Dict[str, Any],
+    *,
+    require_json: bool,
+    validator: Optional[Any] = None,
+    required_keys: Optional[List[str]] = None,
+    non_empty_lists: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Apply common hard safety checks to a Kimi/Moonshot response."""
     content = result.get("content", "") or ""
+    agent = result.get("agent", "")
+    phase = result.get("phase", "")
     if result.get("finish_reason") == "length":
-        return _error_payload("MODEL_OUTPUT_TRUNCATED", "length", result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+        return _error_payload("MODEL_OUTPUT_TRUNCATED", "length", result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
     looped, reason = detect_planning_or_repetition_loop(content)
     if looped:
-        return _error_payload(reason, result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+        return _error_payload(reason, result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
     if len(content) > MAX_REASONABLE_OUTPUT_CHARS:
-        return _error_payload("MODEL_OUTPUT_TOO_LARGE", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+        return _error_payload("MODEL_OUTPUT_TOO_LARGE", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
     if require_json:
         parsed, parse_error = _parse_json_strict(content)
         if parse_error or (isinstance(parsed, dict) and "_raw_text" in parsed):
-            return _error_payload("INVALID_JSON", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+            return _error_payload("INVALID_JSON", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
+        if required_keys and isinstance(parsed, dict):
+            for key in required_keys:
+                if key not in parsed:
+                    return _error_payload(f"MISSING_REQUIRED_KEY:{key}", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
+        if non_empty_lists and isinstance(parsed, dict):
+            for key in non_empty_lists:
+                if not isinstance(parsed.get(key), list) or not parsed.get(key):
+                    return _error_payload(f"EMPTY_REQUIRED_LIST:{key}", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
         if validator:
             validation_error = validator(parsed)
             if validation_error:
-                payload = _error_payload(validation_error, result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+                payload = _error_payload(validation_error, result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
                 payload["parsed_preview"] = parsed if isinstance(parsed, (dict, list)) else None
                 return payload
         ok = dict(result)
         ok["parsed"] = parsed
         return ok
     return dict(result)
+
+
+def phase_result(
+    *,
+    status: str,
+    agent: str,
+    parsed: Optional[Any] = None,
+    error: Optional[str] = None,
+    raw_preview: str = "",
+    finish_reason: Any = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    used_fallback: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "agent": agent,
+        "parsed": parsed,
+        "error": error,
+        "raw_preview": (raw_preview or "")[:RAW_DEBUG_PREVIEW_CHARS],
+        "finish_reason": finish_reason,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "used_fallback": used_fallback,
+    }
+
+
+TRIM_OR_PACKAGE_NAMES = {"n line", "premium", "prestige", "executive", "limited", "luxury", "comfort", "style", "ultimate", "gl", "gls", "lx", "ex"}
+
+
+def normalize_model_name(name: str) -> str:
+    cleaned = re.sub(r"\b(hyundai|kia|toyota|mazda|ford|nissan|mitsubishi|suzuki)\b", "", name or "", flags=re.IGNORECASE)
+    cleaned = re.sub(r"[\u200e\u200f\"'`]", "", cleaned)
+    cleaned = re.sub(r"[^0-9A-Za-zא-ת]+", " ", cleaned).strip().lower()
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def _confidence_rank(value: str) -> int:
+    return {"low": 1, "medium": 2, "high": 3}.get((value or "").lower(), 0)
+
+
+def merge_discovery_candidates(discovery_results: list[dict]) -> dict:
+    merged: Dict[str, Dict[str, Any]] = {}
+    rejected: List[Dict[str, str]] = []
+    failed_agents: List[Dict[str, Any]] = []
+    manufacturer = market = period = ""
+
+    for result in discovery_results:
+        if result.get("status") != "success":
+            failed_agents.append({"agent": result.get("agent"), "error": result.get("error")})
+            continue
+        parsed = result.get("parsed") or {}
+        manufacturer = manufacturer or parsed.get("manufacturer", "")
+        market = market or parsed.get("market", "")
+        period = period or parsed.get("period", "")
+        agent = parsed.get("agent") or result.get("agent")
+        for item in parsed.get("models", []):
+            name = item.get("model_name_en") or item.get("model") or item.get("name") or ""
+            norm = normalize_model_name(name)
+            if not norm:
+                continue
+            if norm in TRIM_OR_PACKAGE_NAMES:
+                rejected.append({"name": name, "reason": "trim_or_package_not_model"})
+                continue
+            entry = merged.setdefault(norm, {
+                "canonical_model_name": name.strip(),
+                "aliases": [],
+                "found_by_agents": [],
+                "confidence": "low",
+                "sources": [],
+                "notes": [],
+            })
+            for alias in (item.get("model_name_he"), *(item.get("aliases") or [])):
+                if alias and alias not in entry["aliases"] and alias != entry["canonical_model_name"]:
+                    entry["aliases"].append(alias)
+            if agent and agent not in entry["found_by_agents"]:
+                entry["found_by_agents"].append(agent)
+            if _confidence_rank(item.get("confidence")) > _confidence_rank(entry["confidence"]):
+                entry["confidence"] = item.get("confidence")
+            for src in item.get("sources") or []:
+                if src and src not in entry["sources"]:
+                    entry["sources"].append(src)
+            if item.get("notes") and item.get("notes") not in entry["notes"]:
+                entry["notes"].append(item["notes"])
+
+    return {
+        "manufacturer": manufacturer,
+        "market": market,
+        "period": period,
+        "candidate_models": sorted(merged.values(), key=lambda x: x["canonical_model_name"].lower()),
+        "rejected_candidates": rejected,
+        "failed_agents": failed_agents,
+    }
 
 
 def validate_discovery_schema(parsed: Any) -> Optional[str]:
@@ -241,8 +357,12 @@ def moonshot_chat(
     use_web_search: bool,
     response_format: Optional[Dict[str, str]] = None,
     max_tokens: int,
+    agent_name: str = "",
+    phase_name: str = "",
 ) -> Dict[str, Any]:
     """Call Kimi and handle Moonshot's server-side builtin $web_search echo loop."""
+    if not max_tokens:
+        raise ValueError("moonshot_chat requires max_tokens for every model call")
     client = OpenAI(api_key=api_key, base_url=MOONSHOT_BASE_URL)
     history = list(messages)
     total_input = 0
@@ -256,7 +376,7 @@ def moonshot_chat(
         kwargs: Dict[str, Any] = {
             "model": KIMI_MODEL,
             "messages": history,
-            "temperature": max(0.6, temperature),
+            "temperature": 0.6 if temperature < 0.6 else temperature,
             "max_tokens": max_tokens,
             "extra_body": {"thinking": {"type": "disabled"}},
         }
@@ -304,7 +424,7 @@ def moonshot_chat(
             kwargs = {
                 "model": KIMI_MODEL,
                 "messages": history,
-                "temperature": max(0.6, temperature),
+                "temperature": 0.6 if temperature < 0.6 else temperature,
                 "max_tokens": max_tokens,
                 "extra_body": {"thinking": {"type": "disabled"}},
                 "tools": WEB_SEARCH_TOOL,
@@ -343,23 +463,23 @@ def moonshot_chat(
         "input_tokens": total_input,
         "output_tokens": total_output,
         "parsed": None,
+        "agent": agent_name,
+        "phase": phase_name,
     }
 
 
-def discovery_prompt(manufacturer: str, market: str, period: str, retry: bool = False) -> List[Dict[str, str]]:
+def discovery_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, retry: bool = False) -> List[Dict[str, str]]:
     retry_prefix = ""
     if retry:
         retry_prefix = (
-            "Your previous response was invalid because it contained planning text.\n"
-            "Return only the final JSON object.\n"
-            "Do not say what you will search.\n"
-            "Do not write \"I need to search\" or \"Let me search\".\n"
-            "Return compact JSON only.\n\n"
+            "Your previous response was invalid.\nReturn only compact JSON.\nDo not describe searching.\n"
+            "Do not write planning text.\nReturn model names only.\nMaximum 25 models.\n"
+            "If unsure, mark confidence=\"low\".\nJSON object only.\n\n"
         )
-    system = MANDATORY_WEB_SEARCH_INSTRUCTION + retry_prefix + f"""You are a strict vehicle model discovery agent.
+    system = MANDATORY_WEB_SEARCH_INSTRUCTION + retry_prefix + f"""You are {agent.key}, a strict focused vehicle model discovery agent.
 
 Task:
-Find passenger vehicle models by the requested manufacturer that were sold in the requested market and period.
+{agent.responsibility}
 
 You must use web search.
 Return only the final JSON object.
@@ -375,6 +495,7 @@ Never write:
 
 Output must be exactly this JSON object:
 {{
+  "agent": "{agent.key}",
   "manufacturer": "...",
   "market": "...",
   "period": "...",
@@ -397,44 +518,52 @@ Rules:
     user = f"""Manufacturer: {manufacturer}
 Market: {market}
 Period: {period}
-Return only this JSON object schema: {{"manufacturer": "{manufacturer}", "market": "{market}", "period": "{period}", "models": [{{"model_name_en": "string", "model_name_he": "string|null", "body_type": "string|null", "years_sold": "string|null", "currently_sold": true, "generations": ["string"], "confidence": "high|medium|low", "sources": ["url"], "notes": "string|null"}}]}}"""
+Return only this JSON object schema: {{"agent": "{agent.key}", "manufacturer": "{manufacturer}", "market": "{market}", "period": "{period}", "models": [{{"model_name_en": "string", "model_name_he": "string|null", "body_type": "string|null", "years_sold": "string|null", "currently_sold": true, "confidence": "high|medium|low", "sources": ["url"], "notes": "string|null"}}]}}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def enrichment_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, model_list: str) -> List[Dict[str, str]]:
+def normalizer_prompt(merged: Dict[str, Any]) -> List[Dict[str, str]]:
+    return [
+        {"role": "system", "content": "You are normalizer_deduper. JSON only. No web search. Clean candidate model names only: normalize names, merge aliases, reject trims, separate distinct models, and flag uncertainty. Do not add technical data."},
+        {"role": "user", "content": "Clean this merged candidate JSON and return schema {\"agent\":\"normalizer_deduper\",\"canonical_models\":[{\"canonical_model_name\":\"string\",\"model_name_he\":\"string|null\",\"aliases\":[\"string\"],\"body_type\":\"sedan|null\",\"currently_sold\":true,\"confidence\":\"high|medium|low\",\"sources\":[\"url\"],\"notes\":\"string|null\"}],\"rejected_items\":[{\"name\":\"string\",\"reason\":\"trim_or_package_not_model\"}],\"needs_review\":[]}.\n" + json.dumps(merged, ensure_ascii=False, indent=2)},
+    ]
+
+
+def technical_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]], retry: bool = False) -> List[Dict[str, str]]:
+    strict = "Your previous response was invalid. Return compact JSON only. Do not describe searching. Use missing_data if unsure.\n" if retry else ""
     system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"""You are {agent.name}, an Israeli-market automotive data enrichment researcher.
 {ISRAEL_ENRICHMENT_CONTEXT}
-ONLY research models in the provided list — do not add models.
-Output ONLY a valid JSON array. No markdown, no explanations."""
+{strict}ONLY research models in the provided canonical model list.
+Do not add new models directly; put model-level surprises in extra_candidate_models.
+Output ONLY a valid JSON object. No markdown, no explanations."""
     user = f"""Manufacturer: {manufacturer}
 Market: {market}
 Period: {period}
-Provided model list:
-{{model_list}}
+Canonical models:
+{json.dumps(canonical_models, ensure_ascii=False, indent=2)}
 
 Responsibility: {agent.responsibility}
-Return ONLY a JSON array keyed by model_name_en/model_name_he where possible.""".format(model_list=model_list)
+Return schema: {{"agent":"{agent.key}","manufacturer":"{manufacturer}","market":"{market}","items":[{{"model":"string","years":"string|null","variant_or_generation":"string|null","data":{{}},"confidence":"high|medium|low","sources":["url"],"notes":"string|null"}}],"missing_data":[{{"model":"string","field":"string","reason":"not_found|conflicting_sources|not_applicable"}}],"extra_candidate_models":[]}}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def consolidation_prompt(discovery: Any, enrichments: Dict[str, Any]) -> List[Dict[str, str]]:
-    schema = {
-        "manufacturer": "string", "market": "string", "period": "string", "models": [{
-            "model_name_en": "string|null", "model_name_he": "string|null", "body_type": "string|null",
-            "years_sold": "string|array|null", "currently_sold": "boolean|null", "generations": "array|null",
-            "trims": "array", "powertrains": "array", "transmission_performance": "array",
-            "dimensions_safety": "object|null", "equipment": "object|null", "sources_notes": "array"
-        }]
-    }
+def verifier_prompt(normalized: Any, technical: Dict[str, Any]) -> List[Dict[str, str]]:
     return [
-        {"role": "system", "content": f"You are Agent 7, a strict JSON consolidation agent. No web search is available.\n{CONSOLIDATION_CONTEXT}"},
-        {"role": "user", "content": "Merge these six agent outputs into one unified JSON object. Fuzzy-match model names across fragments. Use this schema shape:\n" + json.dumps(schema, ensure_ascii=False, indent=2) + "\n\nDiscovery output:\n" + json.dumps(discovery, ensure_ascii=False, indent=2) + "\n\nEnrichment outputs:\n" + json.dumps(enrichments, ensure_ascii=False, indent=2)},
+        {"role": "system", "content": "You are source_verifier. JSON only. No large new research. Review existing structured JSON only; do not invent missing data."},
+        {"role": "user", "content": "Verify Israel-market relevance, model-vs-trim status, contradictions, and unsupported data. Return schema {\"agent\":\"source_verifier\",\"verified_models\":[{\"model\":\"string\",\"status\":\"verified|partial|needs_review\",\"issues\":[],\"confidence\":\"high|medium|low\"}],\"rejected_data_points\":[{\"model\":\"string\",\"field\":\"string\",\"value\":\"string\",\"reason\":\"source_not_israel|conflict|trim_not_model|unsupported\"}],\"needs_review\":[{\"model\":\"string\",\"reason\":\"string\"}]}.\nNormalized:\n" + json.dumps(normalized, ensure_ascii=False, indent=2) + "\nTechnical:\n" + json.dumps(technical, ensure_ascii=False, indent=2)},
+    ]
+
+
+def final_builder_prompt(normalized: Any, technical: Dict[str, Any], verifier: Any, failed_summaries: List[Dict[str, Any]], manufacturer: str, market: str, period: str) -> List[Dict[str, str]]:
+    return [
+        {"role": "system", "content": f"You are final_builder. JSON only. No web search. Build final JSON from clean structured inputs only. Never invent facts.\n{CONSOLIDATION_CONTEXT}"},
+        {"role": "user", "content": f"Manufacturer: {manufacturer}\nMarket: {market}\nPeriod: {period}\nReturn final schema with manufacturer, market, period, status, models, needs_review, rejected, failed_agents, token_usage. Inputs:\nNormalized:\n{json.dumps(normalized, ensure_ascii=False, indent=2)}\nTechnical:\n{json.dumps(technical, ensure_ascii=False, indent=2)}\nVerifier:\n{json.dumps(verifier, ensure_ascii=False, indent=2)}\nFailed agent summaries:\n{json.dumps(failed_summaries, ensure_ascii=False, indent=2)}"},
     ]
 
 
 def summary_prompt(consolidated: Any) -> List[Dict[str, str]]:
     return [
-        {"role": "system", "content": "You are Agent 8. Write a concise Hebrew market summary. No web search is available. Include specific numbers: total models, body-type breakdown, notable models, price ranges if found, and trends over the period."},
+        {"role": "system", "content": "You are Hebrew Summary Agent. Write a concise Hebrew user-facing summary. No web search. Include model count, verified count, needs-review count, technical completeness/partials, and failed agents. Do not change JSON data."},
         {"role": "user", "content": json.dumps(consolidated, ensure_ascii=False, indent=2)},
     ]
 
@@ -467,7 +596,11 @@ def render_sidebar() -> str:
     env_key = os.getenv("MOONSHOT_API_KEY", "")
     api_key = st.sidebar.text_input("Moonshot API key", value=env_key, type="password", help="Reads MOONSHOT_API_KEY by default.")
     st.sidebar.subheader("Agents")
-    st.sidebar.markdown("- Agent 1A: Discovery\n" + "\n".join(f"- {a.name}: {a.description}" for a in ENRICHMENT_AGENTS) + "\n- Agent 7: Consolidation\n- Agent 8: Hebrew summary")
+    st.sidebar.markdown(
+        "- Discovery:\n" + "\n".join(f"  - {a.key}: {a.description}" for a in DISCOVERY_AGENTS) +
+        "\n- Normalizer / deduper\n- Technical enrichment:\n" + "\n".join(f"  - {a.key}: {a.description}" for a in TECHNICAL_AGENTS) +
+        "\n- Source verifier\n- Final builder\n- Hebrew summary"
+    )
     st.sidebar.subheader("Architecture")
     st.sidebar.code(ARCHITECTURE_ASCII)
     return api_key
@@ -490,121 +623,168 @@ def render_persistent_outputs() -> None:
 
 
 
-def run_discovery_agent(api_key: str, manufacturer: str, market: str, period: str) -> Dict[str, Any]:
-    """Run discovery with one bounded retry for planning/repetition loops."""
+RETRYABLE_ERRORS = {"MODEL_PLANNING_LOOP", "MODEL_REPETITION_LOOP", "INVALID_JSON", "MODEL_OUTPUT_TRUNCATED"}
+
+
+def _checked_agent_call(
+    api_key: str,
+    messages: List[Dict[str, Any]],
+    *,
+    agent_name: str,
+    phase_name: str,
+    use_web_search: bool,
+    max_tokens: int,
+    validator: Optional[Any] = None,
+    required_keys: Optional[List[str]] = None,
+    non_empty_lists: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     result = moonshot_chat(
         api_key,
-        discovery_prompt(manufacturer, market, period),
-        temperature=SEARCH_TEMPERATURE,
-        use_web_search=True,
+        messages,
+        temperature=SEARCH_TEMPERATURE if use_web_search else CONSOLIDATION_TEMPERATURE,
+        use_web_search=use_web_search,
         response_format={"type": "json_object"},
-        max_tokens=MAX_DISCOVERY_TOKENS,
+        max_tokens=max_tokens,
+        agent_name=agent_name,
+        phase_name=phase_name,
     )
-    checked = validate_model_response(result, require_json=True, validator=validate_discovery_schema)
-    if checked.get("_error") not in {"MODEL_PLANNING_LOOP", "MODEL_REPETITION_LOOP"}:
-        return checked
+    return validate_model_response(result, require_json=True, validator=validator, required_keys=required_keys, non_empty_lists=non_empty_lists)
 
-    retry = moonshot_chat(
-        api_key,
-        discovery_prompt(manufacturer, market, period, retry=True),
-        temperature=SEARCH_TEMPERATURE,
-        use_web_search=True,
-        response_format={"type": "json_object"},
-        max_tokens=DISCOVERY_RETRY_TOKENS,
+
+def _to_phase_result(agent: str, checked: Dict[str, Any], used_fallback: bool = False) -> Dict[str, Any]:
+    if checked.get("_error"):
+        return phase_result(status="failed", agent=agent, error=checked["_error"], raw_preview=checked.get("raw_preview", ""), finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0), used_fallback=used_fallback)
+    return phase_result(status="success", agent=agent, parsed=checked.get("parsed"), finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0), used_fallback=used_fallback)
+
+
+def run_discovery_agent(api_key: str, agent: AgentConfig, manufacturer: str, market: str, period: str) -> Dict[str, Any]:
+    checked = _checked_agent_call(
+        api_key, discovery_prompt(agent, manufacturer, market, period), agent_name=agent.key, phase_name="discovery",
+        use_web_search=True, max_tokens=MAX_DISCOVERY_TOKENS, validator=validate_discovery_schema, required_keys=["agent", "manufacturer", "market", "period", "models"], non_empty_lists=["models"]
     )
-    retry_checked = validate_model_response(retry, require_json=True, validator=validate_discovery_schema)
-    retry_checked["retry_after_error"] = checked.get("_error")
+    if checked.get("_error") not in RETRYABLE_ERRORS:
+        return _to_phase_result(agent.key, checked)
+    retry_checked = _checked_agent_call(
+        api_key, discovery_prompt(agent, manufacturer, market, period, retry=True), agent_name=agent.key, phase_name="discovery_fallback",
+        use_web_search=True, max_tokens=MAX_DISCOVERY_FALLBACK_TOKENS, validator=validate_discovery_schema, required_keys=["agent", "manufacturer", "market", "period", "models"], non_empty_lists=["models"]
+    )
     retry_checked["input_tokens"] = retry_checked.get("input_tokens", 0) + checked.get("input_tokens", 0)
     retry_checked["output_tokens"] = retry_checked.get("output_tokens", 0) + checked.get("output_tokens", 0)
-    return retry_checked
+    return _to_phase_result(agent.key, retry_checked, used_fallback=True)
+
+
+def run_discovery_phase(api_key: str, manufacturer: str, market: str, period: str) -> List[Dict[str, Any]]:
+    return [run_discovery_agent(api_key, agent, manufacturer, market, period) for agent in DISCOVERY_AGENTS]
+
+
+def run_normalizer_phase(api_key: str, merged: Dict[str, Any]) -> Dict[str, Any]:
+    checked = _checked_agent_call(api_key, normalizer_prompt(merged), agent_name="normalizer_deduper", phase_name="normalizer", use_web_search=False, max_tokens=MAX_TECHNICAL_AGENT_TOKENS, required_keys=["agent", "canonical_models"], non_empty_lists=["canonical_models"])
+    return _to_phase_result("normalizer_deduper", checked)
+
+
+def run_technical_agent(api_key: str, agent: AgentConfig, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> Dict[str, Any]:
+    checked = _checked_agent_call(api_key, technical_prompt(agent, manufacturer, market, period, canonical_models), agent_name=agent.key, phase_name="technical", use_web_search=True, max_tokens=MAX_TECHNICAL_AGENT_TOKENS, required_keys=["agent", "manufacturer", "market", "items", "missing_data"])
+    used_fallback = False
+    if checked.get("_error") in RETRYABLE_ERRORS:
+        checked = _checked_agent_call(api_key, technical_prompt(agent, manufacturer, market, period, canonical_models, retry=True), agent_name=agent.key, phase_name="technical_fallback", use_web_search=True, max_tokens=MAX_TECHNICAL_AGENT_TOKENS, required_keys=["agent", "manufacturer", "market", "items", "missing_data"])
+        used_fallback = True
+    return _to_phase_result(agent.key, checked, used_fallback)
+
+
+def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(run_technical_agent, api_key, a, manufacturer, market, period, canonical_models) for a in TECHNICAL_AGENTS]
+        return [f.result() for f in as_completed(futures)]
+
+
+def run_verification_phase(api_key: str, normalized: Any, technical: Dict[str, Any]) -> Dict[str, Any]:
+    checked = _checked_agent_call(api_key, verifier_prompt(normalized, technical), agent_name="source_verifier", phase_name="verification", use_web_search=False, max_tokens=MAX_VERIFIER_TOKENS, required_keys=["agent", "verified_models", "rejected_data_points", "needs_review"])
+    return _to_phase_result("source_verifier", checked)
+
+
+def run_final_builder_phase(api_key: str, normalized: Any, technical: Dict[str, Any], verifier: Any, failed_summaries: List[Dict[str, Any]], manufacturer: str, market: str, period: str) -> Dict[str, Any]:
+    checked = _checked_agent_call(api_key, final_builder_prompt(normalized, technical, verifier, failed_summaries, manufacturer, market, period), agent_name="final_builder", phase_name="final_builder", use_web_search=False, max_tokens=MAX_FINAL_BUILDER_TOKENS, required_keys=["manufacturer", "market", "period", "status", "models", "failed_agents", "token_usage"])
+    return _to_phase_result("final_builder", checked)
+
+
+def run_hebrew_summary_phase(api_key: str, final_json: Any) -> Dict[str, Any]:
+    result = moonshot_chat(api_key, summary_prompt(final_json), temperature=CONSOLIDATION_TEMPERATURE, use_web_search=False, max_tokens=MAX_SUMMARY_TOKENS, agent_name="hebrew_summary", phase_name="summary")
+    checked = validate_model_response(result, require_json=False)
+    return _to_phase_result("hebrew_summary", checked) if checked.get("_error") else phase_result(status="success", agent="hebrew_summary", parsed={"summary": checked.get("content", "")}, finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0))
 
 def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> None:
     start = time.perf_counter()
-
-    discovery_box = st.empty()
-    discovery_box.info("Phase 1A discovery running...")
-    discovery = run_discovery_agent(api_key, manufacturer, market, period)
-    add_tokens(discovery)
-    if discovery.get("_error"):
-        discovery_box.error(f"Discovery failed: {discovery['_error']}")
-        st.caption(f"Input tokens: {discovery.get('input_tokens', 0):,} | Output tokens: {discovery.get('output_tokens', 0):,}")
-        if discovery.get("raw_preview"):
-            st.text_area("Discovery raw preview", discovery["raw_preview"], height=240)
-        st.session_state.results["agent_1_discovery"] = discovery
-        return
-    discovery_data = discovery["parsed"]
-    model_candidates = discovery_data["models"]
-
-    st.session_state.discovery_data = discovery_data
-    st.session_state.results["agent_1_discovery"] = discovery_data
-    discovery_box.success(f"Phase 1A complete: discovered {len(model_candidates)} models.")
-    with st.expander("Discovered model list", expanded=True):
-        st.json(discovery_data)
-
-    st.subheader("Phase 1B — parallel enrichment")
-    progress = st.progress(0)
-    status_cols = st.columns(3)
-    boxes = {agent.key: status_cols[i % 3].empty() for i, agent in enumerate(ENRICHMENT_AGENTS)}
-    for agent in ENRICHMENT_AGENTS:
-        boxes[agent.key].info(f"{agent.name}: running")
-
-    model_list_text = build_model_list_text(discovery_data)
-    enrichments: Dict[str, Any] = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_map = {
-            executor.submit(moonshot_chat, api_key, enrichment_prompt(agent, manufacturer, market, period, model_list_text), temperature=SEARCH_TEMPERATURE, use_web_search=True, max_tokens=MAX_ENRICHMENT_TOKENS): agent
-            for agent in ENRICHMENT_AGENTS
-        }
-        completed = 0
-        for future in as_completed(future_map):
-            agent = future_map[future]
-            try:
-                result = validate_model_response(future.result(), require_json=True)
-                add_tokens(result)
-                if result.get("_error"):
-                    enrichments[agent.key] = result
-                    boxes[agent.key].error(f"{agent.name}: failed — {result['_error']}")
-                else:
-                    enrichments[agent.key] = result["parsed"]
-                    boxes[agent.key].success(f"{agent.name}: complete")
-            except Exception as exc:
-                enrichments[agent.key] = {"_error": str(exc)}
-                boxes[agent.key].error(f"{agent.name}: failed")
-            completed += 1
-            progress.progress(completed / len(ENRICHMENT_AGENTS))
-
-    st.session_state.results.update(enrichments)
-    failed_enrichments = {key: value for key, value in enrichments.items() if isinstance(value, dict) and value.get("_error")}
-    if failed_enrichments:
-        st.error("Enrichment failed; pipeline aborted before consolidation.")
-        st.json(failed_enrichments)
+    st.subheader("Phase 1 — focused discovery")
+    discovery_results = run_discovery_phase(api_key, manufacturer, market, period)
+    for r in discovery_results:
+        add_tokens(r)
+        st.write(f"{r['agent']}: {r['status']}" + (f" — {r['error']}" if r.get("error") else ""))
+        if r.get("raw_preview"):
+            st.text_area(f"{r['agent']} raw preview", r["raw_preview"], height=120)
+    st.session_state.results["discovery_phase"] = discovery_results
+    successful_discovery = [r for r in discovery_results if r["status"] == "success"]
+    if not successful_discovery:
+        reason = discovery_results[0].get("error") if discovery_results else "NO_DISCOVERY_RESULTS"
+        st.error(f"Discovery failed: {reason}")
         return
 
-    st.subheader("Phase 2 — consolidation")
-    with st.spinner("Consolidating without web search..."):
-        consolidated_result = validate_model_response(
-            moonshot_chat(api_key, consolidation_prompt(discovery_data, enrichments), temperature=CONSOLIDATION_TEMPERATURE, use_web_search=False, response_format={"type": "json_object"}, max_tokens=MAX_CONSOLIDATION_TOKENS),
-            require_json=True,
-        )
-        add_tokens(consolidated_result)
-    if consolidated_result.get("_error"):
-        st.error(f"Consolidation failed: {consolidated_result['_error']}")
-        st.session_state.results["agent_7_consolidation"] = consolidated_result
-        return
-    st.session_state.consolidated = consolidated_result["parsed"]
-    model_count, trim_count = count_models_trims(st.session_state.consolidated)
-    st.success(f"Consolidation complete: {model_count} models, {trim_count} trims.")
+    merged = merge_discovery_candidates(discovery_results)
+    st.session_state.results["python_discovery_merge"] = merged
+    st.success(f"Discovery merge complete: {len(merged['candidate_models'])} candidate models.")
 
-    st.subheader("Phase 3 — Hebrew summary")
-    with st.spinner("Generating Hebrew summary without web search..."):
-        summary_result = validate_model_response(moonshot_chat(api_key, summary_prompt(st.session_state.consolidated), temperature=CONSOLIDATION_TEMPERATURE, use_web_search=False, max_tokens=MAX_SUMMARY_TOKENS), require_json=False)
-        add_tokens(summary_result)
-    if summary_result.get("_error"):
-        st.error(f"Summary failed: {summary_result['_error']}")
-        st.session_state.results["agent_8_summary"] = summary_result
+    st.subheader("Phase 2 — normalizer / deduper")
+    normalizer = run_normalizer_phase(api_key, merged)
+    add_tokens(normalizer)
+    st.session_state.results["normalizer_deduper"] = normalizer
+    if normalizer["status"] != "success":
+        st.error(f"Normalizer failed: {normalizer['error']}")
         return
-    st.session_state.summary = summary_result["content"]
-    st.markdown(st.session_state.summary)
+    canonical_models = normalizer["parsed"].get("canonical_models", [])
+    st.session_state.discovery_data = normalizer["parsed"]
+
+    st.subheader("Phase 3 — technical enrichment")
+    technical_results = run_technical_enrichment_phase(api_key, manufacturer, market, period, canonical_models)
+    technical_clean: Dict[str, Any] = {}
+    failed_summaries: List[Dict[str, Any]] = []
+    for r in technical_results:
+        add_tokens(r)
+        st.write(f"{r['agent']}: {r['status']}" + (f" — {r['error']}" if r.get("error") else ""))
+        if r["status"] == "success":
+            technical_clean[r["agent"]] = r["parsed"]
+        else:
+            failed_summaries.append({"agent": r["agent"], "error": r["error"], "raw_preview": r.get("raw_preview", "")})
+    st.session_state.results["technical_enrichment_phase"] = technical_results
+
+    st.subheader("Phase 4 — verifier")
+    verifier = run_verification_phase(api_key, normalizer["parsed"], technical_clean)
+    add_tokens(verifier)
+    st.session_state.results["source_verifier"] = verifier
+    if verifier["status"] != "success":
+        failed_summaries.append({"agent": "source_verifier", "error": verifier["error"], "raw_preview": verifier.get("raw_preview", "")})
+        verifier_data = {"agent": "source_verifier", "verified_models": [], "rejected_data_points": [], "needs_review": [{"model": "*", "reason": verifier["error"]}]}
+        st.warning(f"Verifier failed: {verifier['error']}; continuing partial.")
+    else:
+        verifier_data = verifier["parsed"]
+
+    st.subheader("Phase 5 — final builder")
+    final = run_final_builder_phase(api_key, normalizer["parsed"], technical_clean, verifier_data, failed_summaries, manufacturer, market, period)
+    add_tokens(final)
+    st.session_state.results["final_builder"] = final
+    if final["status"] != "success":
+        st.error(f"Final builder failed: {final['error']}")
+        return
+    st.session_state.consolidated = final["parsed"]
+    st.success(f"Final JSON complete with status: {final['parsed'].get('status')}")
+
+    st.subheader("Phase 6 — Hebrew summary")
+    summary = run_hebrew_summary_phase(api_key, final["parsed"])
+    add_tokens(summary)
+    st.session_state.results["hebrew_summary"] = summary
+    if summary["status"] == "success":
+        st.session_state.summary = summary["parsed"]["summary"]
+        st.markdown(st.session_state.summary)
+    else:
+        st.warning(f"Summary failed: {summary['error']}")
 
     st.session_state.elapsed = time.perf_counter() - start
     estimated_cost = (st.session_state.input_tokens / 1_000_000 * INPUT_COST_PER_1M) + (st.session_state.output_tokens / 1_000_000 * OUTPUT_COST_PER_1M)
