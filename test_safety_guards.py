@@ -29,10 +29,7 @@ def valid_discovery_text():
         "period": "2010 to June 2026",
         "models": [{
             "model_name_en": "i10",
-            "model_name_he": None,
-            "currently_sold": True,
-            "confidence": "high",
-            "sources": ["https://example.com"],
+            "source_url": "https://example.com",
         }],
     })
 
@@ -69,6 +66,12 @@ def test_valid_discovery_json_object_passes():
     checked = validate_model_response(result(valid_discovery_text()), require_json=True, validator=validate_discovery_schema)
     assert "_error" not in checked
     assert checked["parsed"]["models"][0]["model_name_en"] == "i10"
+
+
+def test_discovery_validator_strips_extra_fields():
+    parsed = {"agent": "a", "models": [{"model_name_en": "i10", "body_type": "hatch", "confidence": "high", "sources": ["https://example.com"]}]}
+    assert validate_discovery_schema(parsed) is None
+    assert parsed["models"] == [{"model_name_en": "i10", "source_url": "https://example.com"}]
 
 
 def test_failed_raw_preview_is_capped_to_2000_chars():
@@ -122,22 +125,21 @@ def test_moonshot_chat_passes_max_tokens_normal_and_retry_paths():
 def test_python_merge_deduplicates_model_names():
     merged = merge_discovery_candidates([
         {"status": "success", "agent": "a1", "parsed": {"manufacturer": "Hyundai", "market": "Israel", "period": "2010-2026", "models": [
-            {"model_name_en": "Hyundai Tucson", "model_name_he": "טוסון", "currently_sold": True, "confidence": "medium", "sources": ["https://a"]}
+            {"model_name_en": "Hyundai Tucson", "source_url": "https://a"}
         ]}},
         {"status": "success", "agent": "a2", "parsed": {"manufacturer": "Hyundai", "market": "Israel", "period": "2010-2026", "models": [
-            {"model_name_en": "Tucson", "model_name_he": None, "currently_sold": None, "confidence": "high", "sources": ["https://b"]}
+            {"model_name_en": "Tucson", "source_url": "https://b"}
         ]}},
     ])
     assert len(merged["candidate_models"]) == 1
-    assert merged["candidate_models"][0]["confidence"] == "high"
     assert set(merged["candidate_models"][0]["sources"]) == {"https://a", "https://b"}
 
 
 def test_python_merge_rejects_obvious_trim_package_names():
     merged = merge_discovery_candidates([
         {"status": "success", "agent": "a1", "parsed": {"manufacturer": "Hyundai", "market": "Israel", "period": "2010-2026", "models": [
-            {"model_name_en": "N Line", "model_name_he": None, "confidence": "low", "sources": ["https://a"]},
-            {"model_name_en": "i20", "model_name_he": None, "confidence": "high", "sources": ["https://b"]},
+            {"model_name_en": "N Line", "source_url": "https://a"},
+            {"model_name_en": "i20", "source_url": "https://b"},
         ]}},
     ])
     assert [x["canonical_model_name"] for x in merged["candidate_models"]] == ["i20"]
@@ -164,17 +166,18 @@ def test_discovery_prompt_is_compact_candidate_schema_only():
     agent = AgentConfig("current_official_lineup_agent", "Current", "Current", "Find current models")
     prompt = "\n".join(m["content"] for m in discovery_prompt(agent, "Hyundai", "Israel", "2010 to June 2026"))
     assert "model_name_en" in prompt
-    assert "currently_sold" in prompt
+    assert "source_url" in prompt
+    assert "currently_sold" not in prompt
     assert "body_type" not in prompt
     assert "years_sold" not in prompt
     assert "generations" not in prompt
     assert "notes" not in prompt
-    assert len(prompt) < 2000
+    assert len(prompt) < 1400
 
 
 def test_discovery_token_limits_are_moderately_increased():
-    assert MAX_DISCOVERY_TOKENS == 3000
-    assert MAX_DISCOVERY_FALLBACK_TOKENS == 2000
+    assert MAX_DISCOVERY_TOKENS == 1800
+    assert MAX_DISCOVERY_FALLBACK_TOKENS == 1200
 
 
 def test_debug_json_uses_json_dumps_formatting():
