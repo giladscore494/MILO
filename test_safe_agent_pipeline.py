@@ -122,12 +122,17 @@ def test_technical_phase_runs_sequentially_without_executor():
     order = []
 
     def fake_agent(api_key, agent, manufacturer, market, period, canonical_models):
-        order.append(agent.key)
+        order.append((agent.key, [m["canonical_model_name"] for m in canonical_models]))
         return app.phase_result(status="success", agent=agent.key, parsed={})
 
+    models = [{"canonical_model_name": f"m{i}"} for i in range(5)]
     with patch("app.run_technical_agent", side_effect=fake_agent):
-        app.run_technical_enrichment_phase("key", "Hyundai", "Israel", "2010-2026", [])
-    assert order == [a.key for a in app.TECHNICAL_AGENTS]
+        app.run_technical_enrichment_phase("key", "Hyundai", "Israel", "2010-2026", models)
+    assert order == [
+        item
+        for a in app.TECHNICAL_AGENTS
+        for item in ((a.key, ["m0", "m1", "m2", "m3"]), (a.key, ["m4"]))
+    ]
 
 
 def test_global_kimi_semaphore_limits_parallel_calls(monkeypatch):
@@ -259,6 +264,97 @@ def test_fallback_prompt_for_each_technical_agent_includes_agent():
         prompt_text = "\n".join(m["content"] for m in app.technical_fallback_prompt(agent, "Hyundai", "Israel", "2010-2026", [{"canonical_model_name": "i10", "sources": ["u"]}]))
         assert f'"agent": "{agent.key}"' in prompt_text
 
+
+def test_technical_agents_are_called_with_chunks_of_max_four(monkeypatch):
+    chunk_lengths = []
+
+    def fake_agent(api_key, agent, manufacturer, market, period, canonical_models):
+        chunk_lengths.append(len(canonical_models))
+        return app.phase_result(status="success", agent=agent.key, parsed={"agent": agent.key, "items": [], "missing_data": [], "extra_candidate_models": []})
+
+    monkeypatch.setattr(app, "run_technical_agent", fake_agent)
+    models = [{"canonical_model_name": f"m{i}", "aliases": ["a", "b", "c", "d"]} for i in range(9)]
+    app.run_technical_enrichment_phase("key", "Hyundai", "Israel", "2010-2026", models)
+    assert app.TECHNICAL_MODEL_CHUNK_SIZE == 4
+    assert chunk_lengths == [4, 4, 1] * len(app.TECHNICAL_AGENTS)
+
+
+def test_fallback_prompt_preserves_same_compact_model_chunk_and_requires_one_item():
+    agent = app.TECHNICAL_AGENTS[1]
+    models = [
+        {"canonical_model_name": "i10", "aliases": ["a1", "a2", "a3", "a4"], "sources": ["s1", "s2", "s3"]},
+        {"canonical_model_name": "i20", "aliases": ["b1"], "sources": ["s4"]},
+    ]
+    prompt_text = "\n".join(m["content"] for m in app.technical_fallback_prompt(agent, "Hyundai", "Israel", "2010-2026", models))
+    assert "i10" in prompt_text and "i20" in prompt_text
+    assert "a4" not in prompt_text
+    assert "s3" not in prompt_text
+    assert "For each model, return at most one item" in prompt_text
+    assert "One compact item per model" in prompt_text
+
+
+def test_run_technical_agent_uses_reduced_fallback_token_limit(monkeypatch):
+    captured = {}
+
+    def fake_safe(*args, **kwargs):
+        captured.update(kwargs)
+        return app.phase_result(status="success", agent=kwargs["agent_name"], parsed={})
+
+    monkeypatch.setattr(app, "run_safe_agent", fake_safe)
+    app.run_technical_agent("key", app.TECHNICAL_AGENTS[1], "Hyundai", "Israel", "2010-2026", [{"canonical_model_name": "i10"}])
+    assert captured["fallback_max_tokens"] == 1200
+
+
+def test_verbose_technical_shapes_are_rejected_and_compact_fields_are_capped():
+    verbose_keys = [
+        ("trims_years_agent", {"model": "i10", "trims_by_year": []}),
+        ("engines_fuel_power_agent", {"model": "i10", "engines_fuel_power": []}),
+        ("transmission_drivetrain_performance_agent", {"model": "i10", "transmission_drivetrain_performance": {}}),
+        ("dimensions_safety_equipment_agent", {"model": "i10", "dimensions": {}, "safety_equipment": {}}),
+    ]
+    for agent, item in verbose_keys:
+        parsed = {"agent": agent, "items": [item], "missing_data": [], "extra_candidate_models": []}
+        assert app.validate_items_schema(parsed) == "TECHNICAL_OUTPUT_TOO_VERBOSE"
+
+    parsed = {
+        "agent": "trims_years_agent",
+        "items": [{
+            "canonical_model_name": "i10",
+            "sources": ["s1", "s2", "s3"],
+            "notes": "x" * 200,
+            "trims": ["1", "2", "3", "4", "5", "6", "7"],
+            "extra": "drop",
+        }],
+        "missing_data": [],
+        "extra_candidate_models": [],
+    }
+    assert app.validate_items_schema(parsed) is None
+    item = parsed["items"][0]
+    assert item["model"] == "i10"
+    assert len(item["sources"]) == 2
+    assert len(item["notes"]) == 160
+    assert item["trims"] == ["1", "2", "3", "4", "5", "6"]
+    assert "extra" not in item
+
+
+def test_phase_3_truncation_message_is_not_discovery_specific():
+    checked = app.validate_model_response(
+        fake_result('{"agent":"trims_years_agent","items":[', finish_reason="length", agent="trims_years_agent", phase="technical"),
+        require_json=True,
+    )
+    assert checked["_error"] == "MODEL_JSON_TRUNCATED"
+    assert "Technical agent produced" in checked["message"]
+    assert "Discovery" not in checked["message"]
+    assert "MAX_DISCOVERY_TOKENS" not in checked["message"]
+
+
+def test_technical_chunk_merge_is_partial_when_one_chunk_truncated():
+    merged = app.merge_chunk_results("trims_years_agent", [
+        app.phase_result(status="failed", agent="trims_years_agent", error="MODEL_JSON_TRUNCATED"),
+        app.phase_result(status="success", agent="trims_years_agent", parsed={"agent": "trims_years_agent", "items": [{"model": "i10"}], "missing_data": [], "extra_candidate_models": []}),
+    ])
+    assert merged["status"] == "partial"
+    assert merged["parsed"]["items"] == [{"model": "i10"}]
 
 
 def test_technical_prompt_includes_required_chunk_context_and_schema():

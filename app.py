@@ -26,6 +26,7 @@ API_CONCURRENCY_MAX_RETRIES = 2
 MAX_DISCOVERY_TOKENS = 1800
 MAX_DISCOVERY_FALLBACK_TOKENS = 1200
 MAX_TECHNICAL_AGENT_TOKENS = 2500
+TECHNICAL_MODEL_CHUNK_SIZE = 4
 MAX_VERIFIER_TOKENS = 3500
 VERIFIER_MODEL_CHUNK_SIZE = 12
 MAX_FINAL_BUILDER_TOKENS = 4500
@@ -175,10 +176,21 @@ def _error_payload(error: str, finish_reason: Any, input_tokens: int, output_tok
         "raw_preview": (content or "")[:RAW_DEBUG_PREVIEW_CHARS],
     }
     if error == "MODEL_JSON_TRUNCATED":
-        payload["message"] = (
-            "Discovery produced valid-looking JSON but exceeded token budget. "
-            "Reduce schema or increase MAX_DISCOVERY_TOKENS."
-        )
+        if (phase or "").startswith("technical"):
+            payload["message"] = (
+                "Technical agent produced valid-looking JSON but exceeded token budget. "
+                "Reduce chunk size or compact the technical schema."
+            )
+        elif (phase or "").startswith("verification"):
+            payload["message"] = (
+                "Verifier produced valid-looking JSON but exceeded token budget. "
+                "Reduce verifier chunk size or compact verifier schema."
+            )
+        else:
+            payload["message"] = (
+                "Discovery produced valid-looking JSON but exceeded token budget. "
+                "Reduce schema or increase MAX_DISCOVERY_TOKENS."
+            )
     return payload
 
 
@@ -602,11 +614,16 @@ def technical_prompt(agent: AgentConfig, manufacturer: str, market: str, period:
         "transmission_drivetrain_performance_agent": '{"agent":"transmission_drivetrain_performance_agent","items":[{"model":"string","years":"string|null","variant_or_generation":"string|null","transmission":"string|null","drivetrain":"FWD|RWD|AWD|4WD|unknown|null","zero_to_100_kmh_sec":0,"confidence":"high|medium|low","sources":["url"],"notes":"string|null"}],"missing_data":[],"extra_candidate_models":[]}',
         "dimensions_safety_equipment_agent": '{"agent":"dimensions_safety_equipment_agent","items":[{"model":"string","years":"string|null","body_type":"string|null","seats":0,"trunk_liters":0,"length_mm":0,"width_mm":0,"height_mm":0,"safety":"string|null","equipment_notes":"string|null","confidence":"high|medium|low","sources":["url"],"notes":"string|null"}],"missing_data":[],"extra_candidate_models":[]}',
     }
+    max_items = TECHNICAL_MAX_ITEMS_PER_MODEL[agent.key]
+    compact_models = compact_technical_models(canonical_models)
     system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"""You are {agent.name}, an Israeli-market automotive data enrichment researcher.
 {ISRAEL_ENRICHMENT_CONTEXT}
 {strict}ONLY research models in the provided canonical model list.
 Do not add new models directly; put surprises in extra_candidate_models.
 Do not invent. If global data is all you find, set confidence low/medium.
+Return flat compact items only. Max {max_items} item(s) per model. Choose representative Israel-market variants; summarize omitted variants briefly.
+Do not enumerate every year, every global trim, or every global engine. Max 2 sources per item. Notes max 160 characters. Trims max 6 strings.
+Forbidden output keys: trims_by_year, engines_fuel_power, engine_code, displacement_cc, cylinders, aspiration, transmission_drivetrain_performance, dimensions, safety_equipment.
 Agent name: {agent.key}
 Output ONLY a valid JSON object that matches the exact JSON schema. No markdown, no explanations.
 Never return generic automotive glossary keys: engine_types, transmission_types, drivetrain_configs, safety_systems, body_types."""
@@ -615,9 +632,10 @@ Market: {market}
 Period: {period}
 Agent name: {agent.key}
 Concrete canonical model chunk:
-{json.dumps(canonical_models, ensure_ascii=False, indent=2)}
+{json.dumps(compact_models, ensure_ascii=False, indent=2)}
 
 Responsibility: {agent.responsibility}
+Limits: max {max_items} item(s) per model; max 2 sources; notes <=160 chars; trims <=6. No nested objects.
 Return exactly this JSON schema shape: {schema_by_agent[agent.key]}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -712,6 +730,39 @@ MISSING_MAKE_MODEL_MARKERS = (
     "please provide the make",
 )
 
+TECHNICAL_VERBOSE_KEYS = {
+    "trims_by_year",
+    "engines_fuel_power",
+    "engine_code",
+    "displacement_cc",
+    "cylinders",
+    "aspiration",
+    "transmission_drivetrain_performance",
+    "dimensions",
+    "safety_equipment",
+}
+
+TECHNICAL_ALLOWED_ITEM_KEYS: Dict[str, set[str]] = {
+    "trims_years_agent": {"model", "years_sold", "generation_or_series", "trims", "confidence", "sources", "notes"},
+    "engines_fuel_power_agent": {"model", "years", "variant_or_generation", "engine", "fuel_type", "power_hp", "torque_nm", "confidence", "sources", "notes"},
+    "transmission_drivetrain_performance_agent": {"model", "years", "variant_or_generation", "transmission", "drivetrain", "zero_to_100_kmh_sec", "confidence", "sources", "notes"},
+    "dimensions_safety_equipment_agent": {"model", "years", "body_type", "seats", "trunk_liters", "length_mm", "width_mm", "height_mm", "safety", "equipment_notes", "confidence", "sources", "notes"},
+}
+
+TECHNICAL_MAX_ITEMS_PER_MODEL = {
+    "trims_years_agent": 1,
+    "engines_fuel_power_agent": 2,
+    "transmission_drivetrain_performance_agent": 1,
+    "dimensions_safety_equipment_agent": 1,
+}
+
+TECHNICAL_FALLBACK_TOKENS = {
+    "trims_years_agent": 1000,
+    "engines_fuel_power_agent": 1200,
+    "transmission_drivetrain_performance_agent": 1000,
+    "dimensions_safety_equipment_agent": 1000,
+}
+
 
 def validate_normalizer_schema(parsed: Any) -> Optional[str]:
     if not isinstance(parsed, dict) or not isinstance(parsed.get("canonical_models"), list):
@@ -734,14 +785,38 @@ def validate_normalizer_schema(parsed: Any) -> Optional[str]:
 def validate_items_schema(parsed: Any) -> Optional[str]:
     if not isinstance(parsed, dict):
         return "INVALID_AGENT_SCHEMA"
+    if TECHNICAL_VERBOSE_KEYS.intersection(parsed.keys()):
+        return "TECHNICAL_OUTPUT_TOO_VERBOSE"
     for key in ("items", "missing_data", "extra_candidate_models"):
         if not isinstance(parsed.get(key), list):
             return f"INVALID_AGENT_SCHEMA:{key}"
+    agent = str(parsed.get("agent", ""))
+    allowed = TECHNICAL_ALLOWED_ITEM_KEYS.get(agent)
+    per_model: Dict[str, int] = {}
     for item in parsed.get("items", []):
-        if not isinstance(item, dict) or not item.get("model"):
+        if not isinstance(item, dict):
             return "INVALID_AGENT_SCHEMA:item_model"
+        if TECHNICAL_VERBOSE_KEYS.intersection(item.keys()):
+            return "TECHNICAL_OUTPUT_TOO_VERBOSE"
+        if "canonical_model_name" in item and not item.get("model"):
+            item["model"] = item.pop("canonical_model_name")
+        if not item.get("model"):
+            return "INVALID_AGENT_SCHEMA:item_model"
+        if allowed:
+            for key in list(item.keys()):
+                if key not in allowed:
+                    item.pop(key, None)
         if not isinstance(item.get("sources"), list):
             item["sources"] = []
+        item["sources"] = item["sources"][:2]
+        if "notes" in item and isinstance(item.get("notes"), str):
+            item["notes"] = item["notes"][:160]
+        if "trims" in item:
+            item["trims"] = item["trims"][:6] if isinstance(item.get("trims"), list) else []
+        model = str(item.get("model"))
+        per_model[model] = per_model.get(model, 0) + 1
+        if per_model[model] > TECHNICAL_MAX_ITEMS_PER_MODEL.get(agent, 1):
+            return "TECHNICAL_OUTPUT_TOO_VERBOSE"
     return None
 
 
@@ -792,6 +867,7 @@ def run_safe_agent(
     prompt: List[Dict[str, Any]],
     max_tokens: int,
     required_top_keys: List[str],
+    fallback_max_tokens: Optional[int] = None,
     response_format: Optional[Dict[str, str]] = {"type": "json_object"},
     fallback_prompt: Optional[List[Dict[str, Any]]] = None,
     allow_partial: bool = False,
@@ -802,11 +878,11 @@ def run_safe_agent(
     if not max_tokens:
         raise ValueError("run_safe_agent requires max_tokens")
 
-    def attempt(messages: List[Dict[str, Any]], phase: str) -> Dict[str, Any]:
+    def attempt(messages: List[Dict[str, Any]], phase: str, token_limit: int) -> Dict[str, Any]:
         attempts = 0
         while True:
             try:
-                return moonshot_chat(api_key, messages, temperature=0.6, use_web_search=use_web_search, response_format=response_format, max_tokens=max_tokens, agent_name=agent_name, phase_name=phase)
+                return moonshot_chat(api_key, messages, temperature=0.6, use_web_search=use_web_search, response_format=response_format, max_tokens=token_limit, agent_name=agent_name, phase_name=phase)
             except Exception as exc:  # noqa: BLE001 - API errors must be classified for UI/tests.
                 if is_kimi_concurrency_error(exc):
                     if attempts < API_CONCURRENCY_MAX_RETRIES:
@@ -818,12 +894,12 @@ def run_safe_agent(
                     return payload
                 raise
 
-    raw = attempt(prompt, phase_name)
+    raw = attempt(prompt, phase_name, max_tokens)
     if raw.get("_error") == "API_CONCURRENCY_LIMIT":
         return safe_agent_result(agent_name, phase_name, raw, api_retry_count=raw.get("api_retry_count", API_CONCURRENCY_MAX_RETRIES), allow_partial=allow_partial)
     checked = validate_model_response(raw, require_json=response_format is not None, validator=validator, required_keys=required_top_keys, non_empty_lists=non_empty_lists)
     if checked.get("_error") in RETRYABLE_ERRORS and fallback_prompt is not None:
-        fallback_raw = attempt(fallback_prompt, f"{phase_name}_fallback")
+        fallback_raw = attempt(fallback_prompt, f"{phase_name}_fallback", fallback_max_tokens or max_tokens)
         if fallback_raw.get("_error") == "API_CONCURRENCY_LIMIT":
             return safe_agent_result(agent_name, phase_name, fallback_raw, api_retry_count=fallback_raw.get("api_retry_count", API_CONCURRENCY_MAX_RETRIES), allow_partial=allow_partial)
         fallback_checked = validate_model_response(fallback_raw, require_json=response_format is not None, validator=validator, required_keys=required_top_keys, non_empty_lists=non_empty_lists)
@@ -853,18 +929,33 @@ def technical_max_tokens(agent_key: str) -> int:
     return 2500 if agent_key == "trims_years_agent" else 3000
 
 
+def compact_technical_models(canonical_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    compact = []
+    for model in canonical_models:
+        if not isinstance(model, dict):
+            continue
+        compact.append({
+            "canonical_model_name": model.get("canonical_model_name"),
+            "model_name_he": model.get("model_name_he"),
+            "aliases": (model.get("aliases") or [])[:3] if isinstance(model.get("aliases"), list) else [],
+            "sources": (model.get("sources") or [])[:2] if isinstance(model.get("sources"), list) else [],
+        })
+    return compact
+
+
 def technical_fallback_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     empty_schema = {"agent": agent.key, "items": [], "missing_data": [], "extra_candidate_models": []}
     task = "trims and years" if agent.key == "trims_years_agent" else "your assigned automotive facts"
+    compact_models = compact_technical_models(canonical_models)
     return [
-        {"role": "system", "content": MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Return compact JSON only. No explanation. Do not return generic automotive glossary keys such as engine_types, transmission_types, drivetrain_configs, safety_systems, or body_types."},
-        {"role": "user", "content": f"Manufacturer: {manufacturer}\nMarket: {market}\nPeriod: {period}\nAgent name: {agent.key}\nConcrete canonical model chunk:\n{json.dumps(canonical_models, ensure_ascii=False, indent=2)}\nTask: Return compact JSON only for {task} for the provided canonical model chunk. Required exact JSON schema: " + json.dumps(empty_schema, ensure_ascii=False)},
+        {"role": "system", "content": MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Return compact JSON only. For each model, return at most one item. Do not list data by year. Do not list every trim. Do not list every engine. Do not output nested objects. Use null/0 when unknown. Keep notes short. No explanation. Do not return generic automotive glossary keys such as engine_types, transmission_types, drivetrain_configs, safety_systems, or body_types."},
+        {"role": "user", "content": f"Manufacturer: {manufacturer}\nMarket: {market}\nPeriod: {period}\nAgent name: {agent.key}\nConcrete canonical model chunk:\n{json.dumps(compact_models, ensure_ascii=False, indent=2)}\nTask: Return compact JSON only for {task} for the provided canonical model chunk. One compact item per model. Max 2 sources per item. Notes max 160 characters. No nested objects or per-year arrays. Required exact JSON schema: " + json.dumps(empty_schema, ensure_ascii=False)},
     ]
 
 
 def run_technical_agent(api_key: str, agent: AgentConfig, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> Dict[str, Any]:
     fallback = technical_fallback_prompt(agent, manufacturer, market, period, canonical_models)
-    return run_safe_agent(api_key, agent_name=agent.key, phase_name="technical", prompt=technical_prompt(agent, manufacturer, market, period, canonical_models), max_tokens=technical_max_tokens(agent.key), required_top_keys=["agent", "items", "missing_data", "extra_candidate_models"], fallback_prompt=fallback, allow_partial=True, use_web_search=True, validator=validate_items_schema)
+    return run_safe_agent(api_key, agent_name=agent.key, phase_name="technical", prompt=technical_prompt(agent, manufacturer, market, period, canonical_models), max_tokens=technical_max_tokens(agent.key), fallback_max_tokens=TECHNICAL_FALLBACK_TOKENS[agent.key], required_top_keys=["agent", "items", "missing_data", "extra_candidate_models"], fallback_prompt=fallback, allow_partial=True, use_web_search=True, validator=validate_items_schema)
 
 
 def merge_chunk_results(agent_name: str, chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -899,7 +990,14 @@ def merge_chunk_results(agent_name: str, chunk_results: List[Dict[str, Any]]) ->
 
 def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     # Stable policy: run Phase 3 technical agents sequentially to avoid Kimi org concurrency=3 failures.
-    return [run_technical_agent(api_key, a, manufacturer, market, period, canonical_models) for a in TECHNICAL_AGENTS]
+    results = []
+    for agent in TECHNICAL_AGENTS:
+        chunk_results = []
+        for i in range(0, len(canonical_models), TECHNICAL_MODEL_CHUNK_SIZE):
+            chunk = canonical_models[i:i + TECHNICAL_MODEL_CHUNK_SIZE]
+            chunk_results.append(run_technical_agent(api_key, agent, manufacturer, market, period, chunk))
+        results.append(merge_chunk_results(agent.key, chunk_results))
+    return results
 
 
 def compact_verifier_input(normalized: Any, technical: Dict[str, Any], failed_summaries: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
