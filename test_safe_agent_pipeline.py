@@ -256,9 +256,55 @@ def test_chunk_merge_includes_agent_at_wrapper_and_parsed_levels():
 
 def test_fallback_prompt_for_each_technical_agent_includes_agent():
     for agent in app.TECHNICAL_AGENTS:
-        prompt_text = "\n".join(m["content"] for m in app.technical_fallback_prompt(agent))
+        prompt_text = "\n".join(m["content"] for m in app.technical_fallback_prompt(agent, "Hyundai", "Israel", "2010-2026", [{"canonical_model_name": "i10", "sources": ["u"]}]))
         assert f'"agent": "{agent.key}"' in prompt_text
 
+
+
+def test_technical_prompt_includes_required_chunk_context_and_schema():
+    agent = app.TECHNICAL_AGENTS[1]
+    models = [{"canonical_model_name": "i10", "sources": ["u"]}]
+    prompt_text = "\n".join(m["content"] for m in app.technical_prompt(agent, "Hyundai", "Israel", "2010-2026", models))
+    assert "Manufacturer: Hyundai" in prompt_text
+    assert "Market: Israel" in prompt_text
+    assert "Period: 2010-2026" in prompt_text
+    assert "Agent name: engines_fuel_power_agent" in prompt_text
+    assert "Concrete canonical model chunk" in prompt_text
+    assert "canonical_model_name" in prompt_text
+    assert "Return exactly this JSON schema shape" in prompt_text
+
+
+def test_technical_fallback_prompt_includes_required_chunk_context_and_schema():
+    agent = app.TECHNICAL_AGENTS[0]
+    models = [{"canonical_model_name": "i10", "sources": ["u"]}]
+    prompt_text = "\n".join(m["content"] for m in app.technical_fallback_prompt(agent, "Hyundai", "Israel", "2010-2026", models))
+    assert "Manufacturer: Hyundai" in prompt_text
+    assert "Market: Israel" in prompt_text
+    assert "Period: 2010-2026" in prompt_text
+    assert "Agent name: trims_years_agent" in prompt_text
+    assert "Concrete canonical model chunk" in prompt_text
+    assert "canonical_model_name" in prompt_text
+    assert "Required exact JSON schema" in prompt_text
+
+
+def test_generic_automotive_top_level_keys_are_rejected():
+    checked = app.validate_model_response(
+        fake_result('{"engine_types":["gasoline"],"agent":"engines_fuel_power_agent","items":[],"missing_data":[],"extra_candidate_models":[]}', agent="engines_fuel_power_agent", phase="technical"),
+        require_json=True,
+        required_keys=["agent", "items", "missing_data", "extra_candidate_models"],
+        validator=app.validate_items_schema,
+    )
+    assert checked["_error"] == "GENERIC_AUTOMOTIVE_OUTPUT"
+
+
+def test_missing_make_model_message_is_not_repaired_as_missing_agent():
+    checked = app.validate_model_response(
+        fake_result('{"message":"Please provide the make and model."}', agent="trims_years_agent", phase="technical"),
+        require_json=True,
+        required_keys=["agent", "items", "missing_data", "extra_candidate_models"],
+        validator=app.validate_items_schema,
+    )
+    assert checked["_error"] == "AGENT_DID_NOT_RECEIVE_MODEL_CHUNK"
 
 def test_verifier_input_excludes_raw_preview_and_raw_failed_text():
     compact = app.compact_verifier_input(

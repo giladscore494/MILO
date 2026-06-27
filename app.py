@@ -206,6 +206,12 @@ def validate_model_response(
         parsed, parse_error = _parse_json_strict(content)
         if parse_error or (isinstance(parsed, dict) and "_raw_text" in parsed):
             return _error_payload("INVALID_JSON", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
+        if phase == "technical" and isinstance(parsed, dict):
+            if GENERIC_AUTOMOTIVE_TOP_LEVEL_KEYS.intersection(parsed.keys()):
+                return _error_payload("GENERIC_AUTOMOTIVE_OUTPUT", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
+            combined_text = json.dumps(parsed, ensure_ascii=False).lower()
+            if any(marker in combined_text for marker in MISSING_MAKE_MODEL_MARKERS):
+                return _error_payload("AGENT_DID_NOT_RECEIVE_MODEL_CHUNK", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
         repaired_fields: List[str] = []
         if phase == "technical" and isinstance(parsed, dict):
             if "agent" not in parsed:
@@ -601,15 +607,18 @@ def technical_prompt(agent: AgentConfig, manufacturer: str, market: str, period:
 {strict}ONLY research models in the provided canonical model list.
 Do not add new models directly; put surprises in extra_candidate_models.
 Do not invent. If global data is all you find, set confidence low/medium.
-Output ONLY a valid JSON object. No markdown, no explanations."""
+Agent name: {agent.key}
+Output ONLY a valid JSON object that matches the exact JSON schema. No markdown, no explanations.
+Never return generic automotive glossary keys: engine_types, transmission_types, drivetrain_configs, safety_systems, body_types."""
     user = f"""Manufacturer: {manufacturer}
 Market: {market}
 Period: {period}
-Canonical models only:
+Agent name: {agent.key}
+Concrete canonical model chunk:
 {json.dumps(canonical_models, ensure_ascii=False, indent=2)}
 
 Responsibility: {agent.responsibility}
-Return exactly this schema shape: {schema_by_agent[agent.key]}"""
+Return exactly this JSON schema shape: {schema_by_agent[agent.key]}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 def final_builder_prompt(normalized: Any, technical: Dict[str, Any], verifier: Any, failed_summaries: List[Dict[str, Any]], manufacturer: str, market: str, period: str) -> List[Dict[str, str]]:
@@ -682,6 +691,26 @@ def render_persistent_outputs() -> None:
 
 
 RETRYABLE_ERRORS = {"MODEL_PLANNING_LOOP", "MODEL_REPETITION_LOOP", "INVALID_JSON", "MODEL_OUTPUT_TRUNCATED", "MODEL_JSON_TRUNCATED"}
+
+GENERIC_AUTOMOTIVE_TOP_LEVEL_KEYS = {
+    "engine_types",
+    "transmission_types",
+    "drivetrain_configs",
+    "safety_systems",
+    "body_types",
+}
+
+MISSING_MAKE_MODEL_MARKERS = (
+    "missing make/model",
+    "missing make and model",
+    "provide make/model",
+    "provide a make/model",
+    "provide the make and model",
+    "need the make and model",
+    "need a make and model",
+    "please specify the make",
+    "please provide the make",
+)
 
 
 def validate_normalizer_schema(parsed: Any) -> Optional[str]:
@@ -824,17 +853,17 @@ def technical_max_tokens(agent_key: str) -> int:
     return 2500 if agent_key == "trims_years_agent" else 3000
 
 
-def technical_fallback_prompt(agent: AgentConfig) -> List[Dict[str, str]]:
+def technical_fallback_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     empty_schema = {"agent": agent.key, "items": [], "missing_data": [], "extra_candidate_models": []}
     task = "trims and years" if agent.key == "trims_years_agent" else "your assigned automotive facts"
     return [
-        {"role": "system", "content": MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Return compact JSON only. No explanation."},
-        {"role": "user", "content": f"Return compact JSON only for {task}. Required top-level schema, including the agent key: " + json.dumps(empty_schema, ensure_ascii=False)},
+        {"role": "system", "content": MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Return compact JSON only. No explanation. Do not return generic automotive glossary keys such as engine_types, transmission_types, drivetrain_configs, safety_systems, or body_types."},
+        {"role": "user", "content": f"Manufacturer: {manufacturer}\nMarket: {market}\nPeriod: {period}\nAgent name: {agent.key}\nConcrete canonical model chunk:\n{json.dumps(canonical_models, ensure_ascii=False, indent=2)}\nTask: Return compact JSON only for {task} for the provided canonical model chunk. Required exact JSON schema: " + json.dumps(empty_schema, ensure_ascii=False)},
     ]
 
 
 def run_technical_agent(api_key: str, agent: AgentConfig, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> Dict[str, Any]:
-    fallback = technical_fallback_prompt(agent)
+    fallback = technical_fallback_prompt(agent, manufacturer, market, period, canonical_models)
     return run_safe_agent(api_key, agent_name=agent.key, phase_name="technical", prompt=technical_prompt(agent, manufacturer, market, period, canonical_models), max_tokens=technical_max_tokens(agent.key), required_top_keys=["agent", "items", "missing_data", "extra_candidate_models"], fallback_prompt=fallback, allow_partial=True, use_web_search=True, validator=validate_items_schema)
 
 
