@@ -3,9 +3,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import (
+    MAX_DISCOVERY_FALLBACK_TOKENS,
+    MAX_DISCOVERY_TOKENS,
     RAW_DEBUG_PREVIEW_CHARS,
     AgentConfig,
     detect_planning_or_repetition_loop,
+    discovery_prompt,
+    format_debug_json,
     merge_discovery_candidates,
     moonshot_chat,
     run_discovery_agent,
@@ -26,13 +30,9 @@ def valid_discovery_text():
         "models": [{
             "model_name_en": "i10",
             "model_name_he": None,
-            "body_type": "hatchback",
-            "years_sold": "2010-2026",
             "currently_sold": True,
-            "generations": ["IA", "AC3"],
             "confidence": "high",
             "sources": ["https://example.com"],
-            "notes": None,
         }],
     })
 
@@ -52,6 +52,12 @@ def test_finish_reason_length_rejected():
     checked = validate_model_response(result('{"ok": true}', finish_reason="length"), require_json=True)
     assert checked["_error"] == "MODEL_OUTPUT_TRUNCATED"
     assert checked["finish_reason"] == "length"
+
+
+def test_finish_reason_length_partial_json_gets_clear_error():
+    checked = validate_model_response(result('{"models":[{"model_name_en":"Santa Fe"', finish_reason="length"), require_json=True)
+    assert checked["_error"] == "MODEL_JSON_TRUNCATED"
+    assert "valid-looking JSON" in checked["message"]
 
 
 def test_invalid_json_rejected():
@@ -116,10 +122,10 @@ def test_moonshot_chat_passes_max_tokens_normal_and_retry_paths():
 def test_python_merge_deduplicates_model_names():
     merged = merge_discovery_candidates([
         {"status": "success", "agent": "a1", "parsed": {"manufacturer": "Hyundai", "market": "Israel", "period": "2010-2026", "models": [
-            {"model_name_en": "Hyundai Tucson", "model_name_he": "טוסון", "confidence": "medium", "sources": ["https://a"], "notes": None}
+            {"model_name_en": "Hyundai Tucson", "model_name_he": "טוסון", "currently_sold": True, "confidence": "medium", "sources": ["https://a"]}
         ]}},
         {"status": "success", "agent": "a2", "parsed": {"manufacturer": "Hyundai", "market": "Israel", "period": "2010-2026", "models": [
-            {"model_name_en": "Tucson", "model_name_he": None, "confidence": "high", "sources": ["https://b"], "notes": "seen"}
+            {"model_name_en": "Tucson", "model_name_he": None, "currently_sold": None, "confidence": "high", "sources": ["https://b"]}
         ]}},
     ])
     assert len(merged["candidate_models"]) == 1
@@ -130,8 +136,8 @@ def test_python_merge_deduplicates_model_names():
 def test_python_merge_rejects_obvious_trim_package_names():
     merged = merge_discovery_candidates([
         {"status": "success", "agent": "a1", "parsed": {"manufacturer": "Hyundai", "market": "Israel", "period": "2010-2026", "models": [
-            {"model_name_en": "N Line", "model_name_he": None, "confidence": "low", "sources": ["https://a"], "notes": None},
-            {"model_name_en": "i20", "model_name_he": None, "confidence": "high", "sources": ["https://b"], "notes": None},
+            {"model_name_en": "N Line", "model_name_he": None, "confidence": "low", "sources": ["https://a"]},
+            {"model_name_en": "i20", "model_name_he": None, "confidence": "high", "sources": ["https://b"]},
         ]}},
     ])
     assert [x["canonical_model_name"] for x in merged["candidate_models"]] == ["i20"]
@@ -152,3 +158,26 @@ def test_discovery_fallback_attempted_at_most_once():
     assert result["status"] == "failed"
     assert result["used_fallback"] is True
     assert calls == ["discovery", "discovery_fallback"]
+
+
+def test_discovery_prompt_is_compact_candidate_schema_only():
+    agent = AgentConfig("current_official_lineup_agent", "Current", "Current", "Find current models")
+    prompt = "\n".join(m["content"] for m in discovery_prompt(agent, "Hyundai", "Israel", "2010 to June 2026"))
+    assert "model_name_en" in prompt
+    assert "currently_sold" in prompt
+    assert "body_type" not in prompt
+    assert "years_sold" not in prompt
+    assert "generations" not in prompt
+    assert "notes" not in prompt
+    assert len(prompt) < 2000
+
+
+def test_discovery_token_limits_are_moderately_increased():
+    assert MAX_DISCOVERY_TOKENS == 3000
+    assert MAX_DISCOVERY_FALLBACK_TOKENS == 2000
+
+
+def test_debug_json_uses_json_dumps_formatting():
+    rendered = format_debug_json({"_error": "MODEL_JSON_TRUNCATED", "finish_reason": "length"})
+    assert '"_error": "MODEL_JSON_TRUNCATED",' in rendered
+    assert '"finish_reason": "length"' in rendered
