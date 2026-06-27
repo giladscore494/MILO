@@ -19,8 +19,8 @@ KIMI_MODEL = "kimi-k2.6"
 SEARCH_TEMPERATURE = 0.6
 CONSOLIDATION_TEMPERATURE = 0.6
 MAX_TOOL_ROUNDS = 15
-MAX_DISCOVERY_TOKENS = 1600
-MAX_DISCOVERY_FALLBACK_TOKENS = 1200
+MAX_DISCOVERY_TOKENS = 3000
+MAX_DISCOVERY_FALLBACK_TOKENS = 2000
 MAX_TECHNICAL_AGENT_TOKENS = 2500
 MAX_VERIFIER_TOKENS = 3500
 MAX_FINAL_BUILDER_TOKENS = 4500
@@ -144,8 +144,17 @@ def _parse_json_strict(content: str) -> Tuple[Optional[Any], Optional[str]]:
         return None, "INVALID_JSON"
 
 
+def _looks_like_partial_json(content: str) -> bool:
+    """Return True when truncated output appears to be an unfinished JSON value."""
+    text = (content or "").lstrip()
+    if not text.startswith(("{", "[")):
+        return False
+    parsed, parse_error = _parse_json_strict(text)
+    return parse_error is not None and parsed is None
+
+
 def _error_payload(error: str, finish_reason: Any, input_tokens: int, output_tokens: int, content: str, *, agent: str = "", phase: str = "") -> Dict[str, Any]:
-    return {
+    payload = {
         "_error": error,
         "agent": agent,
         "phase": phase,
@@ -154,6 +163,12 @@ def _error_payload(error: str, finish_reason: Any, input_tokens: int, output_tok
         "output_tokens": output_tokens,
         "raw_preview": (content or "")[:RAW_DEBUG_PREVIEW_CHARS],
     }
+    if error == "MODEL_JSON_TRUNCATED":
+        payload["message"] = (
+            "Discovery produced valid-looking JSON but exceeded token budget. "
+            "Reduce schema or increase MAX_DISCOVERY_TOKENS."
+        )
+    return payload
 
 
 def validate_model_response(
@@ -169,7 +184,8 @@ def validate_model_response(
     agent = result.get("agent", "")
     phase = result.get("phase", "")
     if result.get("finish_reason") == "length":
-        return _error_payload("MODEL_OUTPUT_TRUNCATED", "length", result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
+        error = "MODEL_JSON_TRUNCATED" if require_json and _looks_like_partial_json(content) else "MODEL_OUTPUT_TRUNCATED"
+        return _error_payload(error, "length", result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
     looped, reason = detect_planning_or_repetition_loop(content)
     if looped:
         return _error_payload(reason, result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content, agent=agent, phase=phase)
@@ -210,6 +226,7 @@ def phase_result(
     input_tokens: int = 0,
     output_tokens: int = 0,
     used_fallback: bool = False,
+    message: str = "",
 ) -> Dict[str, Any]:
     return {
         "status": status,
@@ -221,6 +238,7 @@ def phase_result(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "used_fallback": used_fallback,
+        "message": message,
     }
 
 
@@ -265,9 +283,9 @@ def merge_discovery_candidates(discovery_results: list[dict]) -> dict:
                 "canonical_model_name": name.strip(),
                 "aliases": [],
                 "found_by_agents": [],
+                "currently_sold": None,
                 "confidence": "low",
                 "sources": [],
-                "notes": [],
             })
             for alias in (item.get("model_name_he"), *(item.get("aliases") or [])):
                 if alias and alias not in entry["aliases"] and alias != entry["canonical_model_name"]:
@@ -276,11 +294,11 @@ def merge_discovery_candidates(discovery_results: list[dict]) -> dict:
                 entry["found_by_agents"].append(agent)
             if _confidence_rank(item.get("confidence")) > _confidence_rank(entry["confidence"]):
                 entry["confidence"] = item.get("confidence")
+            if entry["currently_sold"] is not True and item.get("currently_sold") is not None:
+                entry["currently_sold"] = item.get("currently_sold")
             for src in item.get("sources") or []:
                 if src and src not in entry["sources"]:
                     entry["sources"].append(src)
-            if item.get("notes") and item.get("notes") not in entry["notes"]:
-                entry["notes"].append(item["notes"])
 
     return {
         "manufacturer": manufacturer,
@@ -322,17 +340,18 @@ def build_model_list_text(discovery_output: Any) -> str:
         if isinstance(model, dict):
             name_en = model.get("model_name_en") or model.get("name") or model.get("model")
             name_he = model.get("model_name_he")
-            body = model.get("body_type")
-            years = model.get("years_sold")
             current = model.get("currently_sold")
-            generations = model.get("generations")
             lines.append(
-                f"{idx}. model_name_en={name_en}; model_name_he={name_he}; body_type={body}; "
-                f"years_sold={years}; currently_sold={current}; generations={generations}"
+                f"{idx}. model_name_en={name_en}; model_name_he={name_he}; currently_sold={current}"
             )
         else:
             lines.append(f"{idx}. {model}")
     return "\n".join(lines)
+
+
+def format_debug_json(obj: Any) -> str:
+    """Pretty-print debug objects with valid JSON punctuation and Hebrew preserved."""
+    return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
 def _usage_tokens(response: Any) -> Tuple[int, int]:
@@ -469,63 +488,25 @@ def moonshot_chat(
 
 
 def discovery_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, retry: bool = False) -> List[Dict[str, str]]:
-    retry_prefix = ""
-    if retry:
-        retry_prefix = (
-            "Your previous response was invalid.\nReturn only compact JSON.\nDo not describe searching.\n"
-            "Do not write planning text.\nReturn model names only.\nMaximum 25 models.\n"
-            "If unsure, mark confidence=\"low\".\nJSON object only.\n\n"
-        )
-    system = MANDATORY_WEB_SEARCH_INSTRUCTION + retry_prefix + f"""You are {agent.key}, a strict focused vehicle model discovery agent.
-
-Task:
-{agent.responsibility}
-
-You must use web search.
-Return only the final JSON object.
-Do not describe your research process.
-Do not write planning text.
-Never write:
-"I need to search"
-"Let me search"
-"Let me search again"
-"I will search"
-"I'll search"
-"I should search"
-
-Output must be exactly this JSON object:
-{{
-  "agent": "{agent.key}",
-  "manufacturer": "...",
-  "market": "...",
-  "period": "...",
-  "models": [...]
-}}
-
-Rules:
-- Return JSON only.
-- No markdown.
-- No explanation outside JSON.
-- Maximum 40 models.
-- Do not include trims, engines, or variants.
-- Only include model-level names.
-- If unsure, include the model with confidence="low".
-- Prefer Israeli official/importer sources and Israeli automotive sources.
-- Each model should include at least one source URL when possible.
-- If source coverage is incomplete, say so only inside notes.
-- Stop immediately after the JSON object.
-{ISRAEL_DISCOVERY_CONTEXT}"""
+    retry_prefix = "Previous response failed. Return smaller compact JSON only. Maximum 25 models.\n" if retry else ""
+    system = MANDATORY_WEB_SEARCH_INSTRUCTION + retry_prefix + f"""You are {agent.key}. Find candidate Hyundai model names for Israel only.
+Scope: {agent.responsibility}
+Use Israeli official/importer, Israeli car portals, and Israeli used-market sources.
+Return JSON only. No markdown. No planning text. No prose.
+Do not include trims, variants, engines, specifications, dimensions, equipment, history, or extra commentary.
+Maximum 35 model-level candidates."""
     user = f"""Manufacturer: {manufacturer}
 Market: {market}
 Period: {period}
-Return only this JSON object schema: {{"agent": "{agent.key}", "manufacturer": "{manufacturer}", "market": "{market}", "period": "{period}", "models": [{{"model_name_en": "string", "model_name_he": "string|null", "body_type": "string|null", "years_sold": "string|null", "currently_sold": true, "confidence": "high|medium|low", "sources": ["url"], "notes": "string|null"}}]}}"""
+Return this exact compact schema:
+{{"agent":"{agent.key}","manufacturer":"{manufacturer}","market":"{market}","period":"{period}","models":[{{"model_name_en":"string","model_name_he":"string|null","currently_sold":true/false/null,"confidence":"high|medium|low","sources":["url"]}}]}}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def normalizer_prompt(merged: Dict[str, Any]) -> List[Dict[str, str]]:
     return [
         {"role": "system", "content": "You are normalizer_deduper. JSON only. No web search. Clean candidate model names only: normalize names, merge aliases, reject trims, separate distinct models, and flag uncertainty. Do not add technical data."},
-        {"role": "user", "content": "Clean this merged candidate JSON and return schema {\"agent\":\"normalizer_deduper\",\"canonical_models\":[{\"canonical_model_name\":\"string\",\"model_name_he\":\"string|null\",\"aliases\":[\"string\"],\"body_type\":\"sedan|null\",\"currently_sold\":true,\"confidence\":\"high|medium|low\",\"sources\":[\"url\"],\"notes\":\"string|null\"}],\"rejected_items\":[{\"name\":\"string\",\"reason\":\"trim_or_package_not_model\"}],\"needs_review\":[]}.\n" + json.dumps(merged, ensure_ascii=False, indent=2)},
+        {"role": "user", "content": "Clean this merged candidate JSON and return schema {\"agent\":\"normalizer_deduper\",\"canonical_models\":[{\"canonical_model_name\":\"string\",\"model_name_he\":\"string|null\",\"aliases\":[\"string\"],\"currently_sold\":true/false/null,\"confidence\":\"high|medium|low\",\"sources\":[\"url\"]}],\"rejected_items\":[{\"name\":\"string\",\"reason\":\"trim_or_package_not_model\"}],\"needs_review\":[{\"name\":\"string\",\"reason\":\"string\"}]}.\n" + json.dumps(merged, ensure_ascii=False, indent=2)},
     ]
 
 
@@ -613,7 +594,7 @@ def render_persistent_outputs() -> None:
     st.header("Persistent display")
     tab_raw, tab_consolidated, tab_summary = st.tabs(["Raw agent JSON", "Consolidated JSON", "Summary"])
     with tab_raw:
-        st.json(st.session_state.results)
+        st.code(format_debug_json(st.session_state.results), language="json")
     with tab_consolidated:
         st.json(st.session_state.consolidated)
         if st.session_state.consolidated is not None:
@@ -623,7 +604,7 @@ def render_persistent_outputs() -> None:
 
 
 
-RETRYABLE_ERRORS = {"MODEL_PLANNING_LOOP", "MODEL_REPETITION_LOOP", "INVALID_JSON", "MODEL_OUTPUT_TRUNCATED"}
+RETRYABLE_ERRORS = {"MODEL_PLANNING_LOOP", "MODEL_REPETITION_LOOP", "INVALID_JSON", "MODEL_OUTPUT_TRUNCATED", "MODEL_JSON_TRUNCATED"}
 
 
 def _checked_agent_call(
@@ -653,7 +634,7 @@ def _checked_agent_call(
 
 def _to_phase_result(agent: str, checked: Dict[str, Any], used_fallback: bool = False) -> Dict[str, Any]:
     if checked.get("_error"):
-        return phase_result(status="failed", agent=agent, error=checked["_error"], raw_preview=checked.get("raw_preview", ""), finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0), used_fallback=used_fallback)
+        return phase_result(status="failed", agent=agent, error=checked["_error"], raw_preview=checked.get("raw_preview", ""), finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0), used_fallback=used_fallback, message=checked.get("message", ""))
     return phase_result(status="success", agent=agent, parsed=checked.get("parsed"), finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0), used_fallback=used_fallback)
 
 
@@ -720,12 +701,13 @@ def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> N
         add_tokens(r)
         st.write(f"{r['agent']}: {r['status']}" + (f" — {r['error']}" if r.get("error") else ""))
         if r.get("raw_preview"):
-            st.text_area(f"{r['agent']} raw preview", r["raw_preview"], height=120)
+            st.code(format_debug_json(r), language="json")
     st.session_state.results["discovery_phase"] = discovery_results
     successful_discovery = [r for r in discovery_results if r["status"] == "success"]
     if not successful_discovery:
         reason = discovery_results[0].get("error") if discovery_results else "NO_DISCOVERY_RESULTS"
-        st.error(f"Discovery failed: {reason}")
+        message = discovery_results[0].get("message") if discovery_results else ""
+        st.error(f"Discovery failed: {reason}" + (f"\n\n{message}" if message else ""))
         return
 
     merged = merge_discovery_candidates(discovery_results)
