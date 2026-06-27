@@ -19,8 +19,8 @@ KIMI_MODEL = "kimi-k2.6"
 SEARCH_TEMPERATURE = 0.6
 CONSOLIDATION_TEMPERATURE = 0.6
 MAX_TOOL_ROUNDS = 15
-MAX_DISCOVERY_TOKENS = 3000
-MAX_DISCOVERY_FALLBACK_TOKENS = 2000
+MAX_DISCOVERY_TOKENS = 1800
+MAX_DISCOVERY_FALLBACK_TOKENS = 1200
 MAX_TECHNICAL_AGENT_TOKENS = 2500
 MAX_VERIFIER_TOKENS = 3500
 MAX_FINAL_BUILDER_TOKENS = 4500
@@ -90,10 +90,16 @@ class AgentConfig:
 
 
 DISCOVERY_AGENTS: List[AgentConfig] = [
-    AgentConfig("current_official_lineup_agent", "Current official lineup", "Current official/importer models", "Find currently sold models from official importer / official Israel sources."),
-    AgentConfig("historical_used_market_agent", "Historical used market", "Historical used-car/model-list models", "Find historical models sold in Israel using Israeli used-car/model-listing/price-list sources."),
-    AgentConfig("ev_hybrid_edge_cases_agent", "EV/hybrid edge cases", "EV, hybrid, and special models", "Find EV, hybrid, and special models that generic searches may miss."),
+    AgentConfig("current_official_lineup_agent", "Current official lineup", "Current official/importer models", "Return only currently listed Hyundai model names from official Israel/importer sources."),
+    AgentConfig("historical_used_market_agent", "Historical used market", "Historical used-car/model-list models", "Return only historical Hyundai model names that appear in Israeli used-market/model-listing sources."),
+    AgentConfig("ev_hybrid_edge_cases_agent", "EV/hybrid edge cases", "EV/hybrid model names", "Return only EV/hybrid Hyundai model names sold in Israel."),
 ]
+
+DISCOVERY_MAX_MODELS: Dict[str, int] = {
+    "current_official_lineup_agent": 25,
+    "historical_used_market_agent": 40,
+    "ev_hybrid_edge_cases_agent": 25,
+}
 
 TECHNICAL_AGENTS: List[AgentConfig] = [
     AgentConfig("trims_years_agent", "Trims & years", "Israeli trims and years", "Collect Israeli trims / versions, approximate years sold, and generation labels when known."),
@@ -287,18 +293,11 @@ def merge_discovery_candidates(discovery_results: list[dict]) -> dict:
                 "confidence": "low",
                 "sources": [],
             })
-            for alias in (item.get("model_name_he"), *(item.get("aliases") or [])):
-                if alias and alias not in entry["aliases"] and alias != entry["canonical_model_name"]:
-                    entry["aliases"].append(alias)
             if agent and agent not in entry["found_by_agents"]:
                 entry["found_by_agents"].append(agent)
-            if _confidence_rank(item.get("confidence")) > _confidence_rank(entry["confidence"]):
-                entry["confidence"] = item.get("confidence")
-            if entry["currently_sold"] is not True and item.get("currently_sold") is not None:
-                entry["currently_sold"] = item.get("currently_sold")
-            for src in item.get("sources") or []:
-                if src and src not in entry["sources"]:
-                    entry["sources"].append(src)
+            source_url = item.get("source_url")
+            if source_url and source_url not in entry["sources"]:
+                entry["sources"].append(source_url)
 
     return {
         "manufacturer": manufacturer,
@@ -310,18 +309,40 @@ def merge_discovery_candidates(discovery_results: list[dict]) -> dict:
     }
 
 
-def validate_discovery_schema(parsed: Any) -> Optional[str]:
+DISCOVERY_MODEL_ALLOWED_KEYS = {"model_name_en", "source_url"}
+
+
+def strip_or_reject_extra_discovery_fields(parsed: Any) -> Optional[str]:
+    """Strip enriched discovery fields so Discovery stays ultra-thin."""
     if not isinstance(parsed, dict):
         return "INVALID_DISCOVERY_SCHEMA"
     models = parsed.get("models")
     if not isinstance(models, list) or not models:
         return "INVALID_DISCOVERY_SCHEMA"
-    for item in models:
+    max_models = DISCOVERY_MAX_MODELS.get(str(parsed.get("agent", "")), max(DISCOVERY_MAX_MODELS.values()))
+    cleaned = []
+    for item in models[:max_models]:
         if not isinstance(item, dict):
             return "INVALID_DISCOVERY_SCHEMA"
-        if not item.get("model_name_en") or not item.get("confidence") or not isinstance(item.get("sources"), list):
+        name = item.get("model_name_en")
+        if not name or not isinstance(name, str):
             return "INVALID_DISCOVERY_SCHEMA"
+        source_url = item.get("source_url")
+        if source_url is None and isinstance(item.get("sources"), list) and item.get("sources"):
+            source_url = item["sources"][0]
+        if source_url is not None and not isinstance(source_url, str):
+            source_url = str(source_url)
+        cleaned.append({"model_name_en": name.strip(), "source_url": source_url})
+    allowed_top_level = {"agent", "manufacturer", "market", "period", "models"}
+    for key in list(parsed.keys()):
+        if key not in allowed_top_level:
+            parsed.pop(key, None)
+    parsed["models"] = cleaned
     return None
+
+
+def validate_discovery_schema(parsed: Any) -> Optional[str]:
+    return strip_or_reject_extra_discovery_fields(parsed)
 
 
 def build_model_list_text(discovery_output: Any) -> str:
@@ -339,11 +360,8 @@ def build_model_list_text(discovery_output: Any) -> str:
     for idx, model in enumerate(data, start=1):
         if isinstance(model, dict):
             name_en = model.get("model_name_en") or model.get("name") or model.get("model")
-            name_he = model.get("model_name_he")
-            current = model.get("currently_sold")
-            lines.append(
-                f"{idx}. model_name_en={name_en}; model_name_he={name_he}; currently_sold={current}"
-            )
+            source_url = model.get("source_url")
+            lines.append(f"{idx}. model_name_en={name_en}; source_url={source_url}")
         else:
             lines.append(f"{idx}. {model}")
     return "\n".join(lines)
@@ -488,18 +506,28 @@ def moonshot_chat(
 
 
 def discovery_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, retry: bool = False) -> List[Dict[str, str]]:
-    retry_prefix = "Previous response failed. Return smaller compact JSON only. Maximum 25 models.\n" if retry else ""
-    system = MANDATORY_WEB_SEARCH_INSTRUCTION + retry_prefix + f"""You are {agent.key}. Find candidate Hyundai model names for Israel only.
-Scope: {agent.responsibility}
-Use Israeli official/importer, Israeli car portals, and Israeli used-market sources.
-Return JSON only. No markdown. No planning text. No prose.
-Do not include trims, variants, engines, specifications, dimensions, equipment, history, or extra commentary.
-Maximum 35 model-level candidates."""
-    user = f"""Manufacturer: {manufacturer}
+    max_models = DISCOVERY_MAX_MODELS.get(agent.key, 25)
+    if retry:
+        system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. JSON only. No prose. Extra fields are forbidden."
+        user = f'''Return only this compact JSON object:
+{{
+  "agent": "{agent.key}",
+  "models": [
+    {{"model_name_en": "...", "source_url": "..."}}
+  ]
+}}
+No other fields. Maximum {max_models} models. Scope: {agent.responsibility}'''
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Find Hyundai model names for {market}. JSON only; no planning text. Extra model fields are forbidden."
+    user = f'''Manufacturer: {manufacturer}
 Market: {market}
 Period: {period}
-Return this exact compact schema:
-{{"agent":"{agent.key}","manufacturer":"{manufacturer}","market":"{market}","period":"{period}","models":[{{"model_name_en":"string","model_name_he":"string|null","currently_sold":true/false/null,"confidence":"high|medium|low","sources":["url"]}}]}}"""
+Scope: {agent.responsibility}
+Maximum models: {max_models}
+Return only:
+{{"agent":"{agent.key}","manufacturer":"{manufacturer}","market":"{market}","period":"{period}","models":[{{"model_name_en":"string","source_url":"string|null"}}]}}
+No other model fields are allowed.'''
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -641,13 +669,13 @@ def _to_phase_result(agent: str, checked: Dict[str, Any], used_fallback: bool = 
 def run_discovery_agent(api_key: str, agent: AgentConfig, manufacturer: str, market: str, period: str) -> Dict[str, Any]:
     checked = _checked_agent_call(
         api_key, discovery_prompt(agent, manufacturer, market, period), agent_name=agent.key, phase_name="discovery",
-        use_web_search=True, max_tokens=MAX_DISCOVERY_TOKENS, validator=validate_discovery_schema, required_keys=["agent", "manufacturer", "market", "period", "models"], non_empty_lists=["models"]
+        use_web_search=True, max_tokens=MAX_DISCOVERY_TOKENS, validator=validate_discovery_schema, required_keys=["agent", "models"], non_empty_lists=["models"]
     )
     if checked.get("_error") not in RETRYABLE_ERRORS:
         return _to_phase_result(agent.key, checked)
     retry_checked = _checked_agent_call(
         api_key, discovery_prompt(agent, manufacturer, market, period, retry=True), agent_name=agent.key, phase_name="discovery_fallback",
-        use_web_search=True, max_tokens=MAX_DISCOVERY_FALLBACK_TOKENS, validator=validate_discovery_schema, required_keys=["agent", "manufacturer", "market", "period", "models"], non_empty_lists=["models"]
+        use_web_search=True, max_tokens=MAX_DISCOVERY_FALLBACK_TOKENS, validator=validate_discovery_schema, required_keys=["agent", "models"], non_empty_lists=["models"]
     )
     retry_checked["input_tokens"] = retry_checked.get("input_tokens", 0) + checked.get("input_tokens", 0)
     retry_checked["output_tokens"] = retry_checked.get("output_tokens", 0) + checked.get("output_tokens", 0)
