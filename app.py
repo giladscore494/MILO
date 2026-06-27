@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import BoundedSemaphore
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +19,10 @@ KIMI_MODEL = "kimi-k2.6"
 SEARCH_TEMPERATURE = 0.6
 CONSOLIDATION_TEMPERATURE = 0.6
 MAX_TOOL_ROUNDS = 15
+MAX_PARALLEL_KIMI_CALLS = 2
+KIMI_CONCURRENCY_SEMAPHORE = BoundedSemaphore(MAX_PARALLEL_KIMI_CALLS)
+API_CONCURRENCY_RETRY_DELAY_SECONDS = 2
+API_CONCURRENCY_MAX_RETRIES = 2
 MAX_DISCOVERY_TOKENS = 1800
 MAX_DISCOVERY_FALLBACK_TOKENS = 1200
 MAX_TECHNICAL_AGENT_TOKENS = 2500
@@ -232,6 +236,7 @@ def phase_result(
     input_tokens: int = 0,
     output_tokens: int = 0,
     used_fallback: bool = False,
+    api_retry_count: int = 0,
     message: str = "",
 ) -> Dict[str, Any]:
     return {
@@ -244,6 +249,7 @@ def phase_result(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "used_fallback": used_fallback,
+        "api_retry_count": api_retry_count,
         "message": message,
     }
 
@@ -386,6 +392,34 @@ def _message_content(message: Any) -> str:
     return str(content)
 
 
+
+def is_kimi_concurrency_error(exc: Any) -> bool:
+    text = str(exc or "").lower()
+    status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    return (
+        status_code == 429
+        or "http 429" in text
+        or "error code: 429" in text
+        or "max organization concurrency" in text
+        or "rate_limit_reached_error" in text
+    )
+
+
+def _api_concurrency_payload(exc: Any, attempts: int, *, agent: str = "", phase: str = "") -> Dict[str, Any]:
+    message = str(exc)
+    return {
+        "_error": "API_CONCURRENCY_LIMIT",
+        "retryable": True,
+        "message": message,
+        "attempts": attempts,
+        "agent": agent,
+        "phase": phase,
+        "finish_reason": None,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "raw_preview": message[:RAW_DEBUG_PREVIEW_CHARS],
+    }
+
 def moonshot_chat(
     api_key: str,
     messages: List[Dict[str, Any]],
@@ -422,7 +456,8 @@ def moonshot_chat(
         if response_format:
             kwargs["response_format"] = response_format
 
-        response = client.chat.completions.create(**kwargs)
+        with KIMI_CONCURRENCY_SEMAPHORE:
+            response = client.chat.completions.create(**kwargs)
         in_tokens, out_tokens = _usage_tokens(response)
         total_input += in_tokens
         total_output += out_tokens
@@ -469,7 +504,8 @@ def moonshot_chat(
             if response_format:
                 kwargs["response_format"] = response_format
 
-            response = client.chat.completions.create(**kwargs)
+            with KIMI_CONCURRENCY_SEMAPHORE:
+                response = client.chat.completions.create(**kwargs)
             in_tokens, out_tokens = _usage_tokens(response)
             total_input += in_tokens
             total_output += out_tokens
@@ -533,33 +569,39 @@ No other model fields are allowed.'''
 
 def normalizer_prompt(merged: Dict[str, Any]) -> List[Dict[str, str]]:
     return [
-        {"role": "system", "content": "You are normalizer_deduper. JSON only. No web search. Clean candidate model names only: normalize names, merge aliases, reject trims, separate distinct models, and flag uncertainty. Do not add technical data."},
-        {"role": "user", "content": "Clean this merged candidate JSON and return schema {\"agent\":\"normalizer_deduper\",\"canonical_models\":[{\"canonical_model_name\":\"string\",\"model_name_he\":\"string|null\",\"aliases\":[\"string\"],\"currently_sold\":true/false/null,\"confidence\":\"high|medium|low\",\"sources\":[\"url\"]}],\"rejected_items\":[{\"name\":\"string\",\"reason\":\"trim_or_package_not_model\"}],\"needs_review\":[{\"name\":\"string\",\"reason\":\"string\"}]}.\n" + json.dumps(merged, ensure_ascii=False, indent=2)},
+        {"role": "system", "content": "You are normalizer_deduper. JSON only. No web search. Clean candidate model names only: normalize names, merge aliases, reject trims, separate distinct models, and flag uncertainty. Do not add technical data. Hybrid/Electric/PHEV usually become variant notes under a base model unless marketed as standalone; keep Ioniq numbered families and Nexo separate; N Line is a trim/package; uncertain market names and global-only models go to needs_review."},
+        {"role": "user", "content": "Clean this merged candidate JSON and return schema {\"agent\":\"normalizer_deduper\",\"canonical_models\":[{\"canonical_model_name\":\"string\",\"model_name_he\":\"string|null\",\"aliases\":[\"string\"],\"currently_sold\":true/false/null,\"confidence\":\"high|medium|low\",\"sources\":[\"url\"]}],\"rejected_items\":[{\"name\":\"string\",\"reason\":\"trim_or_package_not_model\"}],\"needs_review\":[{\"name\":\"string\",\"reason\":\"string\"}]}. Do not output model_he; use model_name_he.\n" + json.dumps(merged, ensure_ascii=False, indent=2)},
     ]
 
 
 def technical_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]], retry: bool = False) -> List[Dict[str, str]]:
     strict = "Your previous response was invalid. Return compact JSON only. Do not describe searching. Use missing_data if unsure.\n" if retry else ""
+    schema_by_agent = {
+        "trims_years_agent": '{"agent":"trims_years_agent","items":[{"model":"string","years_sold":"string|null","generation_or_series":"string|null","trims":["string"],"confidence":"high|medium|low","sources":["url"],"notes":"string|null"}],"missing_data":[{"model":"string","field":"string","reason":"not_found|conflicting_sources|not_applicable"}],"extra_candidate_models":[]}',
+        "engines_fuel_power_agent": '{"agent":"engines_fuel_power_agent","items":[{"model":"string","years":"string|null","variant_or_generation":"string|null","engine":"string|null","fuel_type":"petrol|diesel|hybrid|plug_in_hybrid|electric|fuel_cell|unknown|null","power_hp":0,"torque_nm":0,"confidence":"high|medium|low","sources":["url"],"notes":"string|null"}],"missing_data":[],"extra_candidate_models":[]}',
+        "transmission_drivetrain_performance_agent": '{"agent":"transmission_drivetrain_performance_agent","items":[{"model":"string","years":"string|null","variant_or_generation":"string|null","transmission":"string|null","drivetrain":"FWD|RWD|AWD|4WD|unknown|null","zero_to_100_kmh_sec":0,"confidence":"high|medium|low","sources":["url"],"notes":"string|null"}],"missing_data":[],"extra_candidate_models":[]}',
+        "dimensions_safety_equipment_agent": '{"agent":"dimensions_safety_equipment_agent","items":[{"model":"string","years":"string|null","body_type":"string|null","seats":0,"trunk_liters":0,"length_mm":0,"width_mm":0,"height_mm":0,"safety":"string|null","equipment_notes":"string|null","confidence":"high|medium|low","sources":["url"],"notes":"string|null"}],"missing_data":[],"extra_candidate_models":[]}',
+    }
     system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"""You are {agent.name}, an Israeli-market automotive data enrichment researcher.
 {ISRAEL_ENRICHMENT_CONTEXT}
 {strict}ONLY research models in the provided canonical model list.
-Do not add new models directly; put model-level surprises in extra_candidate_models.
+Do not add new models directly; put surprises in extra_candidate_models.
+Do not invent. If global data is all you find, set confidence low/medium.
 Output ONLY a valid JSON object. No markdown, no explanations."""
     user = f"""Manufacturer: {manufacturer}
 Market: {market}
 Period: {period}
-Canonical models:
+Canonical models only:
 {json.dumps(canonical_models, ensure_ascii=False, indent=2)}
 
 Responsibility: {agent.responsibility}
-Return schema: {{"agent":"{agent.key}","manufacturer":"{manufacturer}","market":"{market}","items":[{{"model":"string","years":"string|null","variant_or_generation":"string|null","data":{{}},"confidence":"high|medium|low","sources":["url"],"notes":"string|null"}}],"missing_data":[{{"model":"string","field":"string","reason":"not_found|conflicting_sources|not_applicable"}}],"extra_candidate_models":[]}}"""
+Return exactly this schema shape: {schema_by_agent[agent.key]}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
 
 def verifier_prompt(normalized: Any, technical: Dict[str, Any]) -> List[Dict[str, str]]:
     return [
-        {"role": "system", "content": "You are source_verifier. JSON only. No large new research. Review existing structured JSON only; do not invent missing data."},
-        {"role": "user", "content": "Verify Israel-market relevance, model-vs-trim status, contradictions, and unsupported data. Return schema {\"agent\":\"source_verifier\",\"verified_models\":[{\"model\":\"string\",\"status\":\"verified|partial|needs_review\",\"issues\":[],\"confidence\":\"high|medium|low\"}],\"rejected_data_points\":[{\"model\":\"string\",\"field\":\"string\",\"value\":\"string\",\"reason\":\"source_not_israel|conflict|trim_not_model|unsupported\"}],\"needs_review\":[{\"model\":\"string\",\"reason\":\"string\"}]}.\nNormalized:\n" + json.dumps(normalized, ensure_ascii=False, indent=2) + "\nTechnical:\n" + json.dumps(technical, ensure_ascii=False, indent=2)},
+        {"role": "system", "content": "You are source_verifier. JSON only. No broad new research. Review existing structured JSON only; do not invent missing data. If sources are only global or foreign-market, mark needs_review rather than verified."},
+        {"role": "user", "content": "Verify Israel-market relevance, model-vs-trim status, contradictions, unsupported data, source_region, and source_strength. Return schema {\"agent\":\"source_verifier\",\"verified_models\":[{\"model\":\"string\",\"status\":\"verified|partial|needs_review|rejected\",\"confidence\":\"high|medium|low\",\"issues\":[\"string\"],\"source_region\":\"israel|global|foreign_market|unknown\",\"source_strength\":\"official_israel|israeli_auto_portal|used_market|global_official|foreign_market|weak|unknown\"}],\"rejected_data_points\":[{\"model\":\"string\",\"field\":\"string\",\"value\":\"string\",\"reason\":\"source_not_israel|conflict|trim_not_model|unsupported|global_only\"}],\"needs_review\":[{\"model\":\"string\",\"reason\":\"string\"}]}.\nNormalized:\n" + json.dumps(normalized, ensure_ascii=False, indent=2) + "\nTechnical:\n" + json.dumps(technical, ensure_ascii=False, indent=2)},
     ]
 
 
@@ -635,51 +677,132 @@ def render_persistent_outputs() -> None:
 RETRYABLE_ERRORS = {"MODEL_PLANNING_LOOP", "MODEL_REPETITION_LOOP", "INVALID_JSON", "MODEL_OUTPUT_TRUNCATED", "MODEL_JSON_TRUNCATED"}
 
 
-def _checked_agent_call(
+def validate_normalizer_schema(parsed: Any) -> Optional[str]:
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("canonical_models"), list):
+        return "INVALID_NORMALIZER_SCHEMA"
+    if not isinstance(parsed.get("rejected_items"), list) or not isinstance(parsed.get("needs_review"), list):
+        return "INVALID_NORMALIZER_SCHEMA"
+    for item in parsed["canonical_models"]:
+        if not isinstance(item, dict) or not item.get("canonical_model_name"):
+            return "INVALID_NORMALIZER_SCHEMA"
+        if "model_he" in item and "model_name_he" not in item:
+            item["model_name_he"] = item.pop("model_he")
+        item.setdefault("model_name_he", None)
+        if not isinstance(item.get("sources"), list):
+            item["sources"] = []
+    if len(parsed["canonical_models"]) > 45:
+        parsed.setdefault("warnings", []).append("TOO_MANY_CANONICAL_MODELS_REVIEW_REQUIRED")
+    return None
+
+
+def validate_items_schema(parsed: Any) -> Optional[str]:
+    if not isinstance(parsed, dict):
+        return "INVALID_AGENT_SCHEMA"
+    for key in ("items", "missing_data", "extra_candidate_models"):
+        if not isinstance(parsed.get(key), list):
+            return f"INVALID_AGENT_SCHEMA:{key}"
+    for item in parsed.get("items", []):
+        if not isinstance(item, dict) or not item.get("model"):
+            return "INVALID_AGENT_SCHEMA:item_model"
+        if not isinstance(item.get("sources"), list):
+            item["sources"] = []
+    return None
+
+
+def validate_verifier_schema(parsed: Any) -> Optional[str]:
+    if not isinstance(parsed, dict):
+        return "INVALID_VERIFIER_SCHEMA"
+    for key in ("verified_models", "rejected_data_points", "needs_review"):
+        if not isinstance(parsed.get(key), list):
+            return f"INVALID_VERIFIER_SCHEMA:{key}"
+    global_markers = ("hyundaiksa.com", "hyundainews.com", "motortrend.com", "jdpower.com")
+    for item in parsed.get("verified_models", []):
+        if not isinstance(item, dict):
+            return "INVALID_VERIFIER_SCHEMA:model"
+        item.setdefault("source_region", "unknown")
+        item.setdefault("source_strength", "unknown")
+        issues = item.setdefault("issues", [])
+        issue_text = " ".join(str(x).lower() for x in issues)
+        if item.get("source_region") in {"global", "foreign_market"} or item.get("source_strength") in {"global_official", "foreign_market"} or any(m in issue_text for m in global_markers):
+            item["status"] = "needs_review"
+            if item.get("confidence") == "high":
+                item["confidence"] = "medium"
+    return None
+
+
+def validate_final_schema(parsed: Any) -> Optional[str]:
+    if not isinstance(parsed, dict):
+        return "INVALID_FINAL_SCHEMA"
+    for key in ("manufacturer", "market", "period", "status", "models", "needs_review", "rejected", "failed_agents", "token_usage"):
+        if key not in parsed:
+            return f"INVALID_FINAL_SCHEMA:{key}"
+    if not isinstance(parsed.get("models"), list):
+        return "INVALID_FINAL_SCHEMA:models"
+    return None
+
+
+def safe_agent_result(agent: str, phase: str, checked: Dict[str, Any], *, used_fallback: bool = False, api_retry_count: int = 0, allow_partial: bool = False) -> Dict[str, Any]:
+    if checked.get("_error"):
+        status = "partial" if allow_partial and checked.get("_error") in {"API_CONCURRENCY_LIMIT"} else "failed"
+        return phase_result(status=status, agent=agent, parsed=None, error=checked["_error"], raw_preview=checked.get("raw_preview", ""), finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0), used_fallback=used_fallback, api_retry_count=api_retry_count, message=checked.get("message", ""))
+    return phase_result(status="success", agent=agent, parsed=checked.get("parsed"), finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0), used_fallback=used_fallback, api_retry_count=api_retry_count)
+
+
+def run_safe_agent(
     api_key: str,
-    messages: List[Dict[str, Any]],
     *,
     agent_name: str,
     phase_name: str,
-    use_web_search: bool,
+    prompt: List[Dict[str, Any]],
     max_tokens: int,
+    required_top_keys: List[str],
+    response_format: Optional[Dict[str, str]] = {"type": "json_object"},
+    fallback_prompt: Optional[List[Dict[str, Any]]] = None,
+    allow_partial: bool = False,
+    use_web_search: bool = False,
     validator: Optional[Any] = None,
-    required_keys: Optional[List[str]] = None,
     non_empty_lists: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    result = moonshot_chat(
-        api_key,
-        messages,
-        temperature=SEARCH_TEMPERATURE if use_web_search else CONSOLIDATION_TEMPERATURE,
-        use_web_search=use_web_search,
-        response_format={"type": "json_object"},
-        max_tokens=max_tokens,
-        agent_name=agent_name,
-        phase_name=phase_name,
-    )
-    return validate_model_response(result, require_json=True, validator=validator, required_keys=required_keys, non_empty_lists=non_empty_lists)
+    if not max_tokens:
+        raise ValueError("run_safe_agent requires max_tokens")
 
+    def attempt(messages: List[Dict[str, Any]], phase: str) -> Dict[str, Any]:
+        attempts = 0
+        while True:
+            try:
+                return moonshot_chat(api_key, messages, temperature=0.6, use_web_search=use_web_search, response_format=response_format, max_tokens=max_tokens, agent_name=agent_name, phase_name=phase)
+            except Exception as exc:  # noqa: BLE001 - API errors must be classified for UI/tests.
+                if is_kimi_concurrency_error(exc):
+                    if attempts < API_CONCURRENCY_MAX_RETRIES:
+                        attempts += 1
+                        time.sleep(API_CONCURRENCY_RETRY_DELAY_SECONDS)
+                        continue
+                    payload = _api_concurrency_payload(exc, attempts + 1, agent=agent_name, phase=phase)
+                    payload["api_retry_count"] = attempts
+                    return payload
+                raise
 
-def _to_phase_result(agent: str, checked: Dict[str, Any], used_fallback: bool = False) -> Dict[str, Any]:
-    if checked.get("_error"):
-        return phase_result(status="failed", agent=agent, error=checked["_error"], raw_preview=checked.get("raw_preview", ""), finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0), used_fallback=used_fallback, message=checked.get("message", ""))
-    return phase_result(status="success", agent=agent, parsed=checked.get("parsed"), finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0), used_fallback=used_fallback)
+    raw = attempt(prompt, phase_name)
+    if raw.get("_error") == "API_CONCURRENCY_LIMIT":
+        return safe_agent_result(agent_name, phase_name, raw, api_retry_count=raw.get("api_retry_count", API_CONCURRENCY_MAX_RETRIES), allow_partial=allow_partial)
+    checked = validate_model_response(raw, require_json=response_format is not None, validator=validator, required_keys=required_top_keys, non_empty_lists=non_empty_lists)
+    if checked.get("_error") in RETRYABLE_ERRORS and fallback_prompt is not None:
+        fallback_raw = attempt(fallback_prompt, f"{phase_name}_fallback")
+        if fallback_raw.get("_error") == "API_CONCURRENCY_LIMIT":
+            return safe_agent_result(agent_name, phase_name, fallback_raw, api_retry_count=fallback_raw.get("api_retry_count", API_CONCURRENCY_MAX_RETRIES), allow_partial=allow_partial)
+        fallback_checked = validate_model_response(fallback_raw, require_json=response_format is not None, validator=validator, required_keys=required_top_keys, non_empty_lists=non_empty_lists)
+        fallback_checked["input_tokens"] = fallback_checked.get("input_tokens", 0) + checked.get("input_tokens", 0)
+        fallback_checked["output_tokens"] = fallback_checked.get("output_tokens", 0) + checked.get("output_tokens", 0)
+        return safe_agent_result(agent_name, phase_name, fallback_checked, used_fallback=True, allow_partial=allow_partial)
+    return safe_agent_result(agent_name, phase_name, checked, allow_partial=allow_partial)
 
 
 def run_discovery_agent(api_key: str, agent: AgentConfig, manufacturer: str, market: str, period: str) -> Dict[str, Any]:
-    checked = _checked_agent_call(
-        api_key, discovery_prompt(agent, manufacturer, market, period), agent_name=agent.key, phase_name="discovery",
-        use_web_search=True, max_tokens=MAX_DISCOVERY_TOKENS, validator=validate_discovery_schema, required_keys=["agent", "models"], non_empty_lists=["models"]
+    return run_safe_agent(
+        api_key, agent_name=agent.key, phase_name="discovery", prompt=discovery_prompt(agent, manufacturer, market, period),
+        max_tokens=MAX_DISCOVERY_TOKENS, required_top_keys=["agent", "models"], fallback_prompt=discovery_prompt(agent, manufacturer, market, period, retry=True),
+        use_web_search=True, validator=validate_discovery_schema, non_empty_lists=["models"]
     )
-    if checked.get("_error") not in RETRYABLE_ERRORS:
-        return _to_phase_result(agent.key, checked)
-    retry_checked = _checked_agent_call(
-        api_key, discovery_prompt(agent, manufacturer, market, period, retry=True), agent_name=agent.key, phase_name="discovery_fallback",
-        use_web_search=True, max_tokens=MAX_DISCOVERY_FALLBACK_TOKENS, validator=validate_discovery_schema, required_keys=["agent", "models"], non_empty_lists=["models"]
-    )
-    retry_checked["input_tokens"] = retry_checked.get("input_tokens", 0) + checked.get("input_tokens", 0)
-    retry_checked["output_tokens"] = retry_checked.get("output_tokens", 0) + checked.get("output_tokens", 0)
-    return _to_phase_result(agent.key, retry_checked, used_fallback=True)
 
 
 def run_discovery_phase(api_key: str, manufacturer: str, market: str, period: str) -> List[Dict[str, Any]]:
@@ -687,39 +810,49 @@ def run_discovery_phase(api_key: str, manufacturer: str, market: str, period: st
 
 
 def run_normalizer_phase(api_key: str, merged: Dict[str, Any]) -> Dict[str, Any]:
-    checked = _checked_agent_call(api_key, normalizer_prompt(merged), agent_name="normalizer_deduper", phase_name="normalizer", use_web_search=False, max_tokens=MAX_TECHNICAL_AGENT_TOKENS, required_keys=["agent", "canonical_models"], non_empty_lists=["canonical_models"])
-    return _to_phase_result("normalizer_deduper", checked)
+    return run_safe_agent(api_key, agent_name="normalizer_deduper", phase_name="normalizer", prompt=normalizer_prompt(merged), max_tokens=2500, required_top_keys=["agent", "canonical_models", "rejected_items", "needs_review"], use_web_search=False, validator=validate_normalizer_schema, non_empty_lists=["canonical_models"])
+
+
+def technical_max_tokens(agent_key: str) -> int:
+    return 2500 if agent_key == "trims_years_agent" else 3000
 
 
 def run_technical_agent(api_key: str, agent: AgentConfig, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> Dict[str, Any]:
-    checked = _checked_agent_call(api_key, technical_prompt(agent, manufacturer, market, period, canonical_models), agent_name=agent.key, phase_name="technical", use_web_search=True, max_tokens=MAX_TECHNICAL_AGENT_TOKENS, required_keys=["agent", "manufacturer", "market", "items", "missing_data"])
-    used_fallback = False
-    if checked.get("_error") in RETRYABLE_ERRORS:
-        checked = _checked_agent_call(api_key, technical_prompt(agent, manufacturer, market, period, canonical_models, retry=True), agent_name=agent.key, phase_name="technical_fallback", use_web_search=True, max_tokens=MAX_TECHNICAL_AGENT_TOKENS, required_keys=["agent", "manufacturer", "market", "items", "missing_data"])
-        used_fallback = True
-    return _to_phase_result(agent.key, checked, used_fallback)
+    fallback = [{"role": "system", "content": MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Return compact JSON only. No explanation."}, {"role": "user", "content": "Return compact JSON only for trims and years. No explanation." if agent.key == "trims_years_agent" else "Return compact JSON only for your assigned automotive facts. No explanation."}]
+    return run_safe_agent(api_key, agent_name=agent.key, phase_name="technical", prompt=technical_prompt(agent, manufacturer, market, period, canonical_models), max_tokens=technical_max_tokens(agent.key), required_top_keys=["agent", "items", "missing_data", "extra_candidate_models"], fallback_prompt=fallback, allow_partial=True, use_web_search=True, validator=validate_items_schema)
 
 
 def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(run_technical_agent, api_key, a, manufacturer, market, period, canonical_models) for a in TECHNICAL_AGENTS]
-        return [f.result() for f in as_completed(futures)]
+    # Stable policy: run Phase 3 technical agents sequentially to avoid Kimi org concurrency=3 failures.
+    return [run_technical_agent(api_key, a, manufacturer, market, period, canonical_models) for a in TECHNICAL_AGENTS]
 
 
 def run_verification_phase(api_key: str, normalized: Any, technical: Dict[str, Any]) -> Dict[str, Any]:
-    checked = _checked_agent_call(api_key, verifier_prompt(normalized, technical), agent_name="source_verifier", phase_name="verification", use_web_search=False, max_tokens=MAX_VERIFIER_TOKENS, required_keys=["agent", "verified_models", "rejected_data_points", "needs_review"])
-    return _to_phase_result("source_verifier", checked)
+    return run_safe_agent(api_key, agent_name="source_verifier", phase_name="verification", prompt=verifier_prompt(normalized, technical), max_tokens=MAX_VERIFIER_TOKENS, required_top_keys=["agent", "verified_models", "rejected_data_points", "needs_review"], use_web_search=False, validator=validate_verifier_schema)
+
+
+def compact_failed_summaries(failed_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [{"agent": item.get("agent"), "error": item.get("error"), "message": item.get("message", "")} for item in failed_summaries]
 
 
 def run_final_builder_phase(api_key: str, normalized: Any, technical: Dict[str, Any], verifier: Any, failed_summaries: List[Dict[str, Any]], manufacturer: str, market: str, period: str) -> Dict[str, Any]:
-    checked = _checked_agent_call(api_key, final_builder_prompt(normalized, technical, verifier, failed_summaries, manufacturer, market, period), agent_name="final_builder", phase_name="final_builder", use_web_search=False, max_tokens=MAX_FINAL_BUILDER_TOKENS, required_keys=["manufacturer", "market", "period", "status", "models", "failed_agents", "token_usage"])
-    return _to_phase_result("final_builder", checked)
+    safe_failed = compact_failed_summaries(failed_summaries)
+    result = run_safe_agent(api_key, agent_name="final_builder", phase_name="final_builder", prompt=final_builder_prompt(normalized, technical, verifier, safe_failed, manufacturer, market, period), max_tokens=MAX_FINAL_BUILDER_TOKENS, required_top_keys=["manufacturer", "market", "period", "status", "models", "needs_review", "rejected", "failed_agents", "token_usage"], use_web_search=False, validator=validate_final_schema)
+    if result.get("status") == "success" and safe_failed and result.get("parsed", {}).get("status") == "complete":
+        result["parsed"]["status"] = "partial"
+    return result
 
 
 def run_hebrew_summary_phase(api_key: str, final_json: Any) -> Dict[str, Any]:
-    result = moonshot_chat(api_key, summary_prompt(final_json), temperature=CONSOLIDATION_TEMPERATURE, use_web_search=False, max_tokens=MAX_SUMMARY_TOKENS, agent_name="hebrew_summary", phase_name="summary")
-    checked = validate_model_response(result, require_json=False)
-    return _to_phase_result("hebrew_summary", checked) if checked.get("_error") else phase_result(status="success", agent="hebrew_summary", parsed={"summary": checked.get("content", "")}, finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0))
+    try:
+        result = moonshot_chat(api_key, summary_prompt(final_json), temperature=0.6, use_web_search=False, max_tokens=MAX_SUMMARY_TOKENS, agent_name="hebrew_summary", phase_name="summary")
+        checked = validate_model_response(result, require_json=False)
+    except Exception as exc:  # noqa: BLE001
+        if is_kimi_concurrency_error(exc):
+            checked = _api_concurrency_payload(exc, 1, agent="hebrew_summary", phase="summary")
+        else:
+            raise
+    return safe_agent_result("hebrew_summary", "summary", checked) if checked.get("_error") else phase_result(status="success", agent="hebrew_summary", parsed={"summary": checked.get("content", "")}, finish_reason=checked.get("finish_reason"), input_tokens=checked.get("input_tokens", 0), output_tokens=checked.get("output_tokens", 0))
 
 def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> None:
     start = time.perf_counter()
@@ -762,7 +895,7 @@ def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> N
         if r["status"] == "success":
             technical_clean[r["agent"]] = r["parsed"]
         else:
-            failed_summaries.append({"agent": r["agent"], "error": r["error"], "raw_preview": r.get("raw_preview", "")})
+            failed_summaries.append({"agent": r["agent"], "error": r["error"], "message": r.get("message", "")})
     st.session_state.results["technical_enrichment_phase"] = technical_results
 
     st.subheader("Phase 4 — verifier")
@@ -770,7 +903,7 @@ def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> N
     add_tokens(verifier)
     st.session_state.results["source_verifier"] = verifier
     if verifier["status"] != "success":
-        failed_summaries.append({"agent": "source_verifier", "error": verifier["error"], "raw_preview": verifier.get("raw_preview", "")})
+        failed_summaries.append({"agent": "source_verifier", "error": verifier["error"], "message": verifier.get("message", "")})
         verifier_data = {"agent": "source_verifier", "verified_models": [], "rejected_data_points": [], "needs_review": [{"model": "*", "reason": verifier["error"]}]}
         st.warning(f"Verifier failed: {verifier['error']}; continuing partial.")
     else:
