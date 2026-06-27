@@ -19,6 +19,13 @@ KIMI_MODEL = "kimi-k2.6"
 SEARCH_TEMPERATURE = 0.6
 CONSOLIDATION_TEMPERATURE = 0.6
 MAX_TOOL_ROUNDS = 15
+MAX_DISCOVERY_TOKENS = 1800
+MAX_ENRICHMENT_TOKENS = 3000
+MAX_CONSOLIDATION_TOKENS = 5000
+MAX_SUMMARY_TOKENS = 1200
+DISCOVERY_RETRY_TOKENS = 1200
+RAW_DEBUG_PREVIEW_CHARS = 2000
+MAX_REASONABLE_OUTPUT_CHARS = 120_000
 INPUT_COST_PER_1M = 0.95
 OUTPUT_COST_PER_1M = 4.00
 DEFAULT_MANUFACTURER = "Hyundai"
@@ -93,21 +100,94 @@ ENRICHMENT_AGENTS: List[AgentConfig] = [
 ]
 
 
-def _parse_json_safe(content: str) -> Any:
-    """Parse model output as JSON, tolerating Markdown fences and returning raw text on failure."""
+PLANNING_LOOP_LIMITS: Tuple[Tuple[str, int], ...] = (
+    ("I'll search", 3),
+    ("I will search", 3),
+    ("Let me search", 3),
+    ("Let me search again", 2),
+    ("I need to search", 3),
+    ("I need to search for more specific information", 2),
+    ("I need to find", 5),
+    ("I should also search", 5),
+    ("I'll also search", 5),
+    ("search again with different queries", 2),
+)
+
+
+def detect_planning_or_repetition_loop(text: str) -> tuple[bool, str]:
+    """Detect repeated planning/search narration that indicates a model loop."""
+    lowered = (text or "").lower()
+    tripped = []
+    for phrase, limit in PLANNING_LOOP_LIMITS:
+        count = lowered.count(phrase.lower())
+        if count > limit:
+            tripped.append((phrase, count))
+    if not tripped:
+        return False, ""
+    repeated_counts = [count for _, count in tripped]
+    reason = "MODEL_REPETITION_LOOP" if max(repeated_counts) > 5 or len(tripped) > 1 else "MODEL_PLANNING_LOOP"
+    return True, reason
+
+
+def _parse_json_strict(content: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Parse model output as JSON. Invalid JSON is a hard failure."""
     text = (content or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text).strip()
     try:
-        return json.loads(text)
+        return json.loads(text), None
     except Exception:
-        match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except Exception:
-                pass
-    return {"_raw_text": content}
+        return None, "INVALID_JSON"
+
+
+def _error_payload(error: str, finish_reason: Any, input_tokens: int, output_tokens: int, content: str) -> Dict[str, Any]:
+    return {
+        "_error": error,
+        "finish_reason": finish_reason,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "raw_preview": (content or "")[:RAW_DEBUG_PREVIEW_CHARS],
+    }
+
+
+def validate_model_response(result: Dict[str, Any], *, require_json: bool, validator: Optional[Any] = None) -> Dict[str, Any]:
+    """Apply common hard safety checks to a Kimi/Moonshot response."""
+    content = result.get("content", "") or ""
+    if result.get("finish_reason") == "length":
+        return _error_payload("MODEL_OUTPUT_TRUNCATED", "length", result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+    looped, reason = detect_planning_or_repetition_loop(content)
+    if looped:
+        return _error_payload(reason, result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+    if len(content) > MAX_REASONABLE_OUTPUT_CHARS:
+        return _error_payload("MODEL_OUTPUT_TOO_LARGE", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+    if require_json:
+        parsed, parse_error = _parse_json_strict(content)
+        if parse_error or (isinstance(parsed, dict) and "_raw_text" in parsed):
+            return _error_payload("INVALID_JSON", result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+        if validator:
+            validation_error = validator(parsed)
+            if validation_error:
+                payload = _error_payload(validation_error, result.get("finish_reason"), result.get("input_tokens", 0), result.get("output_tokens", 0), content)
+                payload["parsed_preview"] = parsed if isinstance(parsed, (dict, list)) else None
+                return payload
+        ok = dict(result)
+        ok["parsed"] = parsed
+        return ok
+    return dict(result)
+
+
+def validate_discovery_schema(parsed: Any) -> Optional[str]:
+    if not isinstance(parsed, dict):
+        return "INVALID_DISCOVERY_SCHEMA"
+    models = parsed.get("models")
+    if not isinstance(models, list) or not models:
+        return "INVALID_DISCOVERY_SCHEMA"
+    for item in models:
+        if not isinstance(item, dict):
+            return "INVALID_DISCOVERY_SCHEMA"
+        if not item.get("model_name_en") or not item.get("confidence") or not isinstance(item.get("sources"), list):
+            return "INVALID_DISCOVERY_SCHEMA"
+    return None
 
 
 def build_model_list_text(discovery_output: Any) -> str:
@@ -160,6 +240,7 @@ def moonshot_chat(
     temperature: float,
     use_web_search: bool,
     response_format: Optional[Dict[str, str]] = None,
+    max_tokens: int,
 ) -> Dict[str, Any]:
     """Call Kimi and handle Moonshot's server-side builtin $web_search echo loop."""
     client = OpenAI(api_key=api_key, base_url=MOONSHOT_BASE_URL)
@@ -175,7 +256,8 @@ def moonshot_chat(
         kwargs: Dict[str, Any] = {
             "model": KIMI_MODEL,
             "messages": history,
-            "temperature": temperature,
+            "temperature": max(0.6, temperature),
+            "max_tokens": max_tokens,
             "extra_body": {"thinking": {"type": "disabled"}},
         }
         if use_web_search:
@@ -222,7 +304,8 @@ def moonshot_chat(
             kwargs = {
                 "model": KIMI_MODEL,
                 "messages": history,
-                "temperature": temperature,
+                "temperature": max(0.6, temperature),
+                "max_tokens": max_tokens,
                 "extra_body": {"thinking": {"type": "disabled"}},
                 "tools": WEB_SEARCH_TOOL,
             }
@@ -259,20 +342,62 @@ def moonshot_chat(
         "finish_reason": finish_reason,
         "input_tokens": total_input,
         "output_tokens": total_output,
-        "parsed": _parse_json_safe(content),
+        "parsed": None,
     }
 
 
-def discovery_prompt(manufacturer: str, market: str, period: str) -> List[Dict[str, str]]:
-    system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"""You are Agent 1A, an autonomous vehicle-model discovery researcher.
-{ISRAEL_DISCOVERY_CONTEXT}
-Return ONLY a valid JSON array. Each item must include: model_name_en, model_name_he, body_type, years_sold, currently_sold, generations.
-Do not include markdown or explanations. Discover all relevant models through web search at runtime."""
-    user = f"""Discover all passenger vehicle models sold by the given manufacturer in the given market and period.
-Manufacturer: {manufacturer}
+def discovery_prompt(manufacturer: str, market: str, period: str, retry: bool = False) -> List[Dict[str, str]]:
+    retry_prefix = ""
+    if retry:
+        retry_prefix = (
+            "Your previous response was invalid because it contained planning text.\n"
+            "Return only the final JSON object.\n"
+            "Do not say what you will search.\n"
+            "Do not write \"I need to search\" or \"Let me search\".\n"
+            "Return compact JSON only.\n\n"
+        )
+    system = MANDATORY_WEB_SEARCH_INSTRUCTION + retry_prefix + f"""You are a strict vehicle model discovery agent.
+
+Task:
+Find passenger vehicle models by the requested manufacturer that were sold in the requested market and period.
+
+You must use web search.
+Return only the final JSON object.
+Do not describe your research process.
+Do not write planning text.
+Never write:
+"I need to search"
+"Let me search"
+"Let me search again"
+"I will search"
+"I'll search"
+"I should search"
+
+Output must be exactly this JSON object:
+{{
+  "manufacturer": "...",
+  "market": "...",
+  "period": "...",
+  "models": [...]
+}}
+
+Rules:
+- Return JSON only.
+- No markdown.
+- No explanation outside JSON.
+- Maximum 40 models.
+- Do not include trims, engines, or variants.
+- Only include model-level names.
+- If unsure, include the model with confidence="low".
+- Prefer Israeli official/importer sources and Israeli automotive sources.
+- Each model should include at least one source URL when possible.
+- If source coverage is incomplete, say so only inside notes.
+- Stop immediately after the JSON object.
+{ISRAEL_DISCOVERY_CONTEXT}"""
+    user = f"""Manufacturer: {manufacturer}
 Market: {market}
 Period: {period}
-Return ONLY the JSON array."""
+Return only this JSON object schema: {{"manufacturer": "{manufacturer}", "market": "{market}", "period": "{period}", "models": [{{"model_name_en": "string", "model_name_he": "string|null", "body_type": "string|null", "years_sold": "string|null", "currently_sold": true, "generations": ["string"], "confidence": "high|medium|low", "sources": ["url"], "notes": "string|null"}}]}}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -364,26 +489,51 @@ def render_persistent_outputs() -> None:
         st.markdown(st.session_state.summary or "_No summary yet._")
 
 
+
+def run_discovery_agent(api_key: str, manufacturer: str, market: str, period: str) -> Dict[str, Any]:
+    """Run discovery with one bounded retry for planning/repetition loops."""
+    result = moonshot_chat(
+        api_key,
+        discovery_prompt(manufacturer, market, period),
+        temperature=SEARCH_TEMPERATURE,
+        use_web_search=True,
+        response_format={"type": "json_object"},
+        max_tokens=MAX_DISCOVERY_TOKENS,
+    )
+    checked = validate_model_response(result, require_json=True, validator=validate_discovery_schema)
+    if checked.get("_error") not in {"MODEL_PLANNING_LOOP", "MODEL_REPETITION_LOOP"}:
+        return checked
+
+    retry = moonshot_chat(
+        api_key,
+        discovery_prompt(manufacturer, market, period, retry=True),
+        temperature=SEARCH_TEMPERATURE,
+        use_web_search=True,
+        response_format={"type": "json_object"},
+        max_tokens=DISCOVERY_RETRY_TOKENS,
+    )
+    retry_checked = validate_model_response(retry, require_json=True, validator=validate_discovery_schema)
+    retry_checked["retry_after_error"] = checked.get("_error")
+    retry_checked["input_tokens"] = retry_checked.get("input_tokens", 0) + checked.get("input_tokens", 0)
+    retry_checked["output_tokens"] = retry_checked.get("output_tokens", 0) + checked.get("output_tokens", 0)
+    return retry_checked
+
 def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> None:
     start = time.perf_counter()
 
     discovery_box = st.empty()
     discovery_box.info("Phase 1A discovery running...")
-    discovery = moonshot_chat(api_key, discovery_prompt(manufacturer, market, period), temperature=SEARCH_TEMPERATURE, use_web_search=True)
+    discovery = run_discovery_agent(api_key, manufacturer, market, period)
     add_tokens(discovery)
+    if discovery.get("_error"):
+        discovery_box.error(f"Discovery failed: {discovery['_error']}")
+        st.caption(f"Input tokens: {discovery.get('input_tokens', 0):,} | Output tokens: {discovery.get('output_tokens', 0):,}")
+        if discovery.get("raw_preview"):
+            st.text_area("Discovery raw preview", discovery["raw_preview"], height=240)
+        st.session_state.results["agent_1_discovery"] = discovery
+        return
     discovery_data = discovery["parsed"]
-    if isinstance(discovery_data, dict) and "_raw_text" in discovery_data:
-        discovery_box.error("Discovery failed: Agent 1A did not return valid JSON. Pipeline aborted.")
-        st.session_state.results["agent_1_discovery"] = discovery
-        return
-    if isinstance(discovery_data, dict):
-        model_candidates = next((discovery_data.get(k) for k in ("models", "data", "result", "vehicles") if isinstance(discovery_data.get(k), list)), None)
-    else:
-        model_candidates = discovery_data
-    if not isinstance(model_candidates, list) or not model_candidates:
-        discovery_box.error("Discovery failed: no model list was returned. Pipeline aborted.")
-        st.session_state.results["agent_1_discovery"] = discovery
-        return
+    model_candidates = discovery_data["models"]
 
     st.session_state.discovery_data = discovery_data
     st.session_state.results["agent_1_discovery"] = discovery_data
@@ -402,17 +552,21 @@ def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> N
     enrichments: Dict[str, Any] = {}
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_map = {
-            executor.submit(moonshot_chat, api_key, enrichment_prompt(agent, manufacturer, market, period, model_list_text), temperature=SEARCH_TEMPERATURE, use_web_search=True): agent
+            executor.submit(moonshot_chat, api_key, enrichment_prompt(agent, manufacturer, market, period, model_list_text), temperature=SEARCH_TEMPERATURE, use_web_search=True, max_tokens=MAX_ENRICHMENT_TOKENS): agent
             for agent in ENRICHMENT_AGENTS
         }
         completed = 0
         for future in as_completed(future_map):
             agent = future_map[future]
             try:
-                result = future.result()
+                result = validate_model_response(future.result(), require_json=True)
                 add_tokens(result)
-                enrichments[agent.key] = result["parsed"]
-                boxes[agent.key].success(f"{agent.name}: complete")
+                if result.get("_error"):
+                    enrichments[agent.key] = result
+                    boxes[agent.key].error(f"{agent.name}: failed — {result['_error']}")
+                else:
+                    enrichments[agent.key] = result["parsed"]
+                    boxes[agent.key].success(f"{agent.name}: complete")
             except Exception as exc:
                 enrichments[agent.key] = {"_error": str(exc)}
                 boxes[agent.key].error(f"{agent.name}: failed")
@@ -420,19 +574,35 @@ def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> N
             progress.progress(completed / len(ENRICHMENT_AGENTS))
 
     st.session_state.results.update(enrichments)
+    failed_enrichments = {key: value for key, value in enrichments.items() if isinstance(value, dict) and value.get("_error")}
+    if failed_enrichments:
+        st.error("Enrichment failed; pipeline aborted before consolidation.")
+        st.json(failed_enrichments)
+        return
 
     st.subheader("Phase 2 — consolidation")
     with st.spinner("Consolidating without web search..."):
-        consolidated_result = moonshot_chat(api_key, consolidation_prompt(discovery_data, enrichments), temperature=CONSOLIDATION_TEMPERATURE, use_web_search=False, response_format={"type": "json_object"})
+        consolidated_result = validate_model_response(
+            moonshot_chat(api_key, consolidation_prompt(discovery_data, enrichments), temperature=CONSOLIDATION_TEMPERATURE, use_web_search=False, response_format={"type": "json_object"}, max_tokens=MAX_CONSOLIDATION_TOKENS),
+            require_json=True,
+        )
         add_tokens(consolidated_result)
+    if consolidated_result.get("_error"):
+        st.error(f"Consolidation failed: {consolidated_result['_error']}")
+        st.session_state.results["agent_7_consolidation"] = consolidated_result
+        return
     st.session_state.consolidated = consolidated_result["parsed"]
     model_count, trim_count = count_models_trims(st.session_state.consolidated)
     st.success(f"Consolidation complete: {model_count} models, {trim_count} trims.")
 
     st.subheader("Phase 3 — Hebrew summary")
     with st.spinner("Generating Hebrew summary without web search..."):
-        summary_result = moonshot_chat(api_key, summary_prompt(st.session_state.consolidated), temperature=CONSOLIDATION_TEMPERATURE, use_web_search=False)
+        summary_result = validate_model_response(moonshot_chat(api_key, summary_prompt(st.session_state.consolidated), temperature=CONSOLIDATION_TEMPERATURE, use_web_search=False, max_tokens=MAX_SUMMARY_TOKENS), require_json=False)
         add_tokens(summary_result)
+    if summary_result.get("_error"):
+        st.error(f"Summary failed: {summary_result['_error']}")
+        st.session_state.results["agent_8_summary"] = summary_result
+        return
     st.session_state.summary = summary_result["content"]
     st.markdown(st.session_state.summary)
 
