@@ -28,8 +28,8 @@ MAX_DISCOVERY_FALLBACK_TOKENS = 1200
 MAX_TECHNICAL_AGENT_TOKENS = 2500
 TECHNICAL_MODEL_CHUNK_SIZE = 4
 MAX_VERIFIER_TOKENS = 3500
-VERIFIER_MODEL_CHUNK_SIZE = 12
-MAX_FINAL_BUILDER_TOKENS = 4500
+VERIFIER_MODEL_CHUNK_SIZE = 6
+MAX_FINAL_BUILDER_TOKENS = 4500  # retained only for optional compact final summaries
 MAX_SUMMARY_TOKENS = 1200
 RAW_DEBUG_PREVIEW_CHARS = 2000
 MAX_REASONABLE_OUTPUT_CHARS = 120_000
@@ -640,16 +640,31 @@ Return exactly this JSON schema shape: {schema_by_agent[agent.key]}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 def final_builder_prompt(normalized: Any, technical: Dict[str, Any], verifier: Any, failed_summaries: List[Dict[str, Any]], manufacturer: str, market: str, period: str) -> List[Dict[str, str]]:
+    """Optional compact LLM prompt; never used to build the full models JSON."""
+    model_count = len((normalized or {}).get("canonical_models", [])) if isinstance(normalized, dict) else 0
+    verifier_status = (verifier or {}).get("status") or ("success" if verifier else "failed")
     return [
-        {"role": "system", "content": f"You are final_builder. JSON only. No web search. Build final JSON from clean structured inputs only. Never invent facts.\n{CONSOLIDATION_CONTEXT}"},
-        {"role": "user", "content": f"Manufacturer: {manufacturer}\nMarket: {market}\nPeriod: {period}\nReturn final schema with manufacturer, market, period, status, models, needs_review, rejected, failed_agents, token_usage. Inputs:\nNormalized:\n{json.dumps(normalized, ensure_ascii=False, indent=2)}\nTechnical:\n{json.dumps(technical, ensure_ascii=False, indent=2)}\nVerifier:\n{json.dumps(verifier, ensure_ascii=False, indent=2)}\nFailed agent summaries:\n{json.dumps(failed_summaries, ensure_ascii=False, indent=2)}"},
+        {"role": "system", "content": "You are final_builder_summary. JSON only. No web search. Write only compact quality notes from metadata; do not generate models."},
+        {"role": "user", "content": f"Manufacturer: {manufacturer}\nMarket: {market}\nPeriod: {period}\nReturn compact schema {{\"quality_summary\":\"string\",\"hebrew_summary_hint\":\"string\"}}. Metadata only:\n" + json.dumps({"model_count": model_count, "verifier_status": verifier_status, "failed_agents": compact_failed_summaries(failed_summaries), "status": "partial_success" if failed_summaries else "complete"}, ensure_ascii=False)},
     ]
 
 
 def summary_prompt(consolidated: Any) -> List[Dict[str, str]]:
+    models = consolidated.get("models", []) if isinstance(consolidated, dict) else []
+    compact = {
+        "manufacturer": consolidated.get("manufacturer") if isinstance(consolidated, dict) else None,
+        "market": consolidated.get("market") if isinstance(consolidated, dict) else None,
+        "period": consolidated.get("period") if isinstance(consolidated, dict) else None,
+        "status": consolidated.get("status") if isinstance(consolidated, dict) else None,
+        "model_count": len(models),
+        "verified_count": sum(1 for m in models if isinstance(m, dict) and m.get("verification_status") == "verified"),
+        "needs_review_count": len(consolidated.get("needs_review", [])) if isinstance(consolidated, dict) else 0,
+        "failed_agents": consolidated.get("failed_agents", []) if isinstance(consolidated, dict) else [],
+        "pipeline_quality": consolidated.get("pipeline_quality", {}) if isinstance(consolidated, dict) else {},
+    }
     return [
         {"role": "system", "content": "You are Hebrew Summary Agent. Write a concise Hebrew user-facing summary. No web search. Include model count, verified count, needs-review count, technical completeness/partials, and failed agents. Do not change JSON data."},
-        {"role": "user", "content": json.dumps(consolidated, ensure_ascii=False, indent=2)},
+        {"role": "user", "content": json.dumps(compact, ensure_ascii=False, indent=2)},
     ]
 
 
@@ -830,14 +845,20 @@ def validate_verifier_schema(parsed: Any) -> Optional[str]:
     for item in parsed.get("verified_models", []):
         if not isinstance(item, dict):
             return "INVALID_VERIFIER_SCHEMA:model"
-        item.setdefault("source_region", "unknown")
         item.setdefault("source_strength", "unknown")
         issues = item.setdefault("issues", [])
+        if not isinstance(issues, list):
+            issues = [str(issues)]
+        item["issues"] = [str(issue)[:120] for issue in issues[:2]]
         issue_text = " ".join(str(x).lower() for x in issues)
-        if item.get("source_region") in {"global", "foreign_market"} or item.get("source_strength") in {"global_official", "foreign_market"} or any(m in issue_text for m in global_markers):
+        if item.get("source_strength") in {"global_official", "foreign_market"} or any(m in issue_text for m in global_markers):
             item["status"] = "needs_review"
             if item.get("confidence") == "high":
                 item["confidence"] = "medium"
+    for key in ("needs_review", "rejected_data_points"):
+        for item in parsed.get(key, []):
+            if isinstance(item, dict) and isinstance(item.get("issues"), list):
+                item["issues"] = [str(issue)[:120] for issue in item["issues"][:2]]
     return None
 
 
@@ -1024,8 +1045,8 @@ def compact_verifier_input(normalized: Any, technical: Dict[str, Any], failed_su
 def verifier_prompt(normalized: Any, technical: Dict[str, Any], failed_summaries: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, str]]:
     compact_input = compact_verifier_input(normalized, technical, failed_summaries)
     return [
-        {"role": "system", "content": "You are source_verifier. JSON only. No broad new research. Review existing compact structured JSON only; do not invent missing data. If sources are only global or foreign-market, mark needs_review rather than verified."},
-        {"role": "user", "content": "Verify Israel-market relevance, model-vs-trim status, contradictions, unsupported data, source_region, and source_strength. Return schema {\"agent\":\"source_verifier\",\"verified_models\":[],\"rejected_data_points\":[],\"needs_review\":[]} with compact objects in those lists. Compact input:\n" + json.dumps(compact_input, ensure_ascii=False, indent=2)},
+        {"role": "system", "content": "You are source_verifier. JSON only. No broad new research. Review compact structured JSON only; do not invent missing data. Keep output ultra-compact."},
+        {"role": "user", "content": "Verify Israel-market relevance and contradictions. Return schema {\"agent\":\"source_verifier\",\"verified_models\":[],\"rejected_data_points\":[],\"needs_review\":[]}. Each model object must be {\"model\":\"string\",\"status\":\"verified|partial|needs_review|rejected\",\"confidence\":\"high|medium|low\",\"issues\":[\"short\"],\"source_strength\":\"official_israel|israeli_auto_portal|used_market|global_official|foreign_market|weak|unknown\"}. Max 2 issues per model; each issue <=120 chars. Avoid rejected_data_points unless essential. Compact input:\n" + json.dumps(compact_input, ensure_ascii=False, separators=(",", ":"))},
     ]
 
 
@@ -1045,11 +1066,11 @@ def merge_verifier_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     parsed = {"agent": "source_verifier", "verified_models": [], "rejected_data_points": [], "needs_review": []}
     failed = []
     input_tokens = output_tokens = 0
-    for result in results:
+    for idx, result in enumerate(results):
         input_tokens += result.get("input_tokens", 0)
         output_tokens += result.get("output_tokens", 0)
         if result.get("status") not in {"success", "partial"}:
-            failed.append({"agent": result.get("agent"), "error": result.get("error")})
+            failed.append({"agent": result.get("agent"), "error": result.get("error"), "chunk_index": idx})
             continue
         data = result.get("parsed") or {}
         for key in ("verified_models", "rejected_data_points", "needs_review"):
@@ -1066,15 +1087,173 @@ def run_verification_phase(api_key: str, normalized: Any, technical: Dict[str, A
 
 
 def compact_failed_summaries(failed_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [{"agent": item.get("agent"), "error": item.get("error"), "message": item.get("message", "")} for item in failed_summaries]
+    compact = []
+    for item in failed_summaries:
+        entry = {"agent": item.get("agent"), "error": item.get("error"), "message": str(item.get("message", ""))[:160]}
+        if "chunk_index" in item:
+            entry["chunk_index"] = item.get("chunk_index")
+        if "models" in item:
+            entry["models"] = item.get("models")
+        compact.append(entry)
+    return compact
+
+
+def normalize_model_key(name: Any) -> str:
+    """Normalize model names for deterministic cross-agent matching."""
+    if not name:
+        return ""
+    text = str(name).strip()
+    text = re.sub(r"\bioniq\b", "IONIQ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[^0-9a-zA-Zא-ת]+", " ", text).strip().lower()
+    return re.sub(r"\s+", " ", text)
+
+
+def _confidence_rank(value: Any) -> int:
+    return {"low": 1, "medium": 2, "high": 3}.get(str(value or "").lower(), 0)
+
+
+def _best_item(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return sorted(items, key=lambda item: _confidence_rank(item.get("confidence")), reverse=True)[0] if items else {}
+
+
+def _technical_index(technical: Dict[str, Any]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    index: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for agent, parsed in (technical or {}).items():
+        if not isinstance(parsed, dict):
+            continue
+        for item in parsed.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            key = normalize_model_key(item.get("canonical_model_name") or item.get("model"))
+            if key:
+                index.setdefault(agent, {}).setdefault(key, []).append(item)
+    return index
+
+
+def _verifier_index(verifier: Any) -> Dict[str, Dict[str, Any]]:
+    parsed = verifier.get("parsed") if isinstance(verifier, dict) and "parsed" in verifier else verifier
+    index: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(parsed, dict):
+        return index
+    for key in ("verified_models", "needs_review"):
+        for item in parsed.get(key, []):
+            if isinstance(item, dict):
+                model_key = normalize_model_key(item.get("model") or item.get("canonical_model_name"))
+                if model_key:
+                    index[model_key] = item
+    return index
+
+
+def _candidate_keys(base_model: Dict[str, Any]) -> List[str]:
+    names = [base_model.get("canonical_model_name"), base_model.get("model")]
+    names.extend(base_model.get("aliases", []) if isinstance(base_model.get("aliases"), list) else [])
+    return [key for key in (normalize_model_key(name) for name in names) if key]
+
+
+def _first_match(index: Dict[str, List[Dict[str, Any]]], keys: List[str]) -> Dict[str, Any]:
+    for key in keys:
+        if key in index:
+            return _best_item(index[key])
+    return {}
+
+
+def merge_model_data(base_model: Dict[str, Any], trims: Dict[str, Any], engines: Dict[str, Any], transmission: Dict[str, Any], dimensions: Dict[str, Any], verifier: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge one canonical model with the best matching compact technical records."""
+    sources: List[Any] = []
+    for item in (base_model, trims, engines, transmission, dimensions):
+        for source in item.get("sources", []) if isinstance(item, dict) else []:
+            if source and source not in sources:
+                sources.append(source)
+    notes = [item.get("notes") for item in (trims, engines, transmission, dimensions) if isinstance(item, dict) and item.get("notes")]
+    verifier_status = verifier.get("status") if verifier else "partial"
+    verifier_notes = None
+    if verifier:
+        issues = verifier.get("issues") if isinstance(verifier.get("issues"), list) else []
+        verifier_notes = "; ".join(str(i)[:120] for i in issues[:2]) or verifier.get("reason")
+    else:
+        verifier_notes = "Verifier did not complete for this model"
+    confidence = min(
+        [c for c in [base_model.get("confidence"), trims.get("confidence"), engines.get("confidence"), transmission.get("confidence"), dimensions.get("confidence"), verifier.get("confidence") if verifier else None] if c],
+        key=_confidence_rank,
+        default="low",
+    )
+    return {
+        "canonical_model_name": base_model.get("canonical_model_name") or base_model.get("model"),
+        "model_name_he": base_model.get("model_name_he"),
+        "aliases": base_model.get("aliases", []) if isinstance(base_model.get("aliases"), list) else [],
+        "currently_sold": base_model.get("currently_sold"),
+        "years_sold": trims.get("years_sold"),
+        "generation_or_series": trims.get("generation_or_series"),
+        "body_type": dimensions.get("body_type"),
+        "seats": dimensions.get("seats"),
+        "trunk_liters": dimensions.get("trunk_liters"),
+        "length_mm": dimensions.get("length_mm"),
+        "width_mm": dimensions.get("width_mm"),
+        "height_mm": dimensions.get("height_mm"),
+        "engine": engines.get("engine"),
+        "fuel_type": engines.get("fuel_type"),
+        "power_hp": engines.get("power_hp"),
+        "torque_nm": engines.get("torque_nm"),
+        "transmission": transmission.get("transmission"),
+        "drivetrain": transmission.get("drivetrain"),
+        "zero_to_100_kmh_sec": transmission.get("zero_to_100_kmh_sec"),
+        "safety": dimensions.get("safety"),
+        "equipment_notes": dimensions.get("equipment_notes") or ("; ".join(notes)[:300] if notes else None),
+        "confidence": confidence if confidence in {"high", "medium", "low"} else "low",
+        "sources": sources,
+        "verification_status": verifier_status if verifier_status in {"verified", "partial", "needs_review", "rejected"} else "partial",
+        "verification_notes": verifier_notes,
+    }
+
+
+def build_final_json_python(normalized: Any, technical: Dict[str, Any], verifier: Any, failed_summaries: List[Dict[str, Any]], manufacturer: str, market: str, period: str) -> Dict[str, Any]:
+    canonical = (normalized or {}).get("canonical_models", []) if isinstance(normalized, dict) else []
+    tech_index = _technical_index(technical)
+    verify_index = _verifier_index(verifier)
+    failed = compact_failed_summaries(failed_summaries)
+    models = []
+    merged_count = 0
+    for base in canonical:
+        if not isinstance(base, dict):
+            continue
+        keys = _candidate_keys(base)
+        agent_items = {agent: _first_match(items, keys) for agent, items in tech_index.items()}
+        merged_count += sum(1 for item in agent_items.values() if item)
+        verify = next((verify_index[k] for k in keys if k in verify_index), {})
+        models.append(merge_model_data(
+            base,
+            agent_items.get("trims_years_agent", {}),
+            agent_items.get("engines_fuel_power_agent", {}),
+            agent_items.get("transmission_drivetrain_performance_agent", {}),
+            agent_items.get("dimensions_safety_equipment_agent", {}),
+            verify,
+        ))
+    verifier_status = "failed"
+    if isinstance(verifier, dict):
+        verifier_status = verifier.get("status") or ("success" if verifier.get("verified_models") is not None else "failed")
+    tech_status = "success" if len(technical or {}) == len(TECHNICAL_AGENTS) else ("partial" if technical else "failed")
+    data_depth = "full_technical" if merged_count >= len(models) * 3 and models else ("partial_technical" if merged_count else "model_list_only")
+    status = "complete" if not failed and verifier_status == "success" and tech_status == "success" else ("partial_success" if models else "failed")
+    needs_review = [m for m in models if m.get("verification_status") in {"partial", "needs_review"}]
+    return {
+        "manufacturer": manufacturer,
+        "market": market,
+        "period": period,
+        "status": status,
+        "models": models,
+        "needs_review": needs_review,
+        "rejected": [m for m in models if m.get("verification_status") == "rejected"],
+        "failed_agents": failed,
+        "pipeline_quality": {"discovery": "success", "normalizer": "success", "technical_enrichment": tech_status, "verifier": verifier_status, "final_builder": "success", "data_depth": data_depth},
+        "token_usage": {},
+        "final_builder_method": "python_merge_success",
+        "technical_items_merged_count": merged_count,
+    }
 
 
 def run_final_builder_phase(api_key: str, normalized: Any, technical: Dict[str, Any], verifier: Any, failed_summaries: List[Dict[str, Any]], manufacturer: str, market: str, period: str) -> Dict[str, Any]:
-    safe_failed = compact_failed_summaries(failed_summaries)
-    result = run_safe_agent(api_key, agent_name="final_builder", phase_name="final_builder", prompt=final_builder_prompt(normalized, technical, verifier, safe_failed, manufacturer, market, period), max_tokens=MAX_FINAL_BUILDER_TOKENS, required_top_keys=["manufacturer", "market", "period", "status", "models", "needs_review", "rejected", "failed_agents", "token_usage"], use_web_search=False, validator=validate_final_schema)
-    if result.get("status") == "success" and safe_failed and result.get("parsed", {}).get("status") == "complete":
-        result["parsed"]["status"] = "partial"
-    return result
+    parsed = build_final_json_python(normalized, technical, verifier, failed_summaries, manufacturer, market, period)
+    return phase_result(status="success", agent="final_builder", parsed=parsed, finish_reason="python_merge_success")
 
 
 def run_hebrew_summary_phase(api_key: str, final_json: Any) -> Dict[str, Any]:
@@ -1142,13 +1321,16 @@ def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> N
     st.session_state.results["source_verifier"] = verifier
     if verifier["status"] == "success":
         verifier_data = verifier["parsed"]
+        verifier_data["status"] = "success"
     elif verifier["status"] == "partial" and isinstance(verifier.get("parsed"), dict):
         failed_summaries.append({"agent": "source_verifier", "error": verifier["error"], "message": verifier.get("message", "")})
+        failed_summaries.extend(verifier.get("failed_chunks", []))
         verifier_data = verifier["parsed"]
+        verifier_data["status"] = "partial"
         st.warning(f"Verifier partially failed: {verifier['error']}; continuing partial.")
     else:
         failed_summaries.append({"agent": "source_verifier", "error": verifier["error"], "message": verifier.get("message", "")})
-        verifier_data = {"agent": "source_verifier", "verified_models": [], "rejected_data_points": [], "needs_review": [{"model": "*", "reason": verifier["error"]}]}
+        verifier_data = {"agent": "source_verifier", "status": "failed", "verified_models": [], "rejected_data_points": [], "needs_review": [{"model": "*", "reason": verifier["error"]}]}
         st.warning(f"Verifier failed: {verifier['error']}; continuing partial.")
 
     st.subheader("Phase 5 — final builder")
@@ -1159,7 +1341,14 @@ def run_pipeline(api_key: str, manufacturer: str, market: str, period: str) -> N
         st.error(f"Final builder failed: {final['error']}")
         return
     st.session_state.consolidated = final["parsed"]
-    st.success(f"Final JSON complete with status: {final['parsed'].get('status')}")
+    st.success(
+        "Phase 5 final builder: python_merge_success — "
+        f"{len(final['parsed'].get('models', []))} models, "
+        f"{final['parsed'].get('technical_items_merged_count', 0)} technical items merged, "
+        f"verifier={final['parsed'].get('pipeline_quality', {}).get('verifier')}, "
+        f"failed verifier chunks={len(verifier.get('failed_chunks', [])) if isinstance(verifier, dict) else 0}, "
+        f"data_depth={final['parsed'].get('pipeline_quality', {}).get('data_depth')}"
+    )
 
     st.subheader("Phase 6 — Hebrew summary")
     summary = run_hebrew_summary_phase(api_key, final["parsed"])

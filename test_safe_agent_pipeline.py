@@ -60,7 +60,6 @@ def test_agents_3_to_8_use_shared_safe_wrapper():
         "transmission_drivetrain_performance_agent",
         "dimensions_safety_equipment_agent",
         "source_verifier",
-        "final_builder",
     ]
 
 
@@ -177,18 +176,13 @@ def test_raw_failed_output_is_capped_to_constant():
     assert len(checked["raw_preview"]) == app.RAW_DEBUG_PREVIEW_CHARS
 
 
-def test_final_builder_never_receives_raw_failed_text():
-    captured = {}
-
-    def fake_safe(*args, **kwargs):
-        captured["prompt"] = kwargs["prompt"]
-        return app.phase_result(status="success", agent="final_builder", parsed={"status": "partial"})
-
-    with patch("app.run_safe_agent", side_effect=fake_safe):
-        app.run_final_builder_phase("key", {}, {}, {}, [{"agent": "a", "error": "INVALID_JSON", "raw_preview": "SECRET_RAW"}], "Hyundai", "Israel", "2010-2026")
-    prompt_text = json.dumps(captured["prompt"], ensure_ascii=False)
-    assert "SECRET_RAW" not in prompt_text
-    assert "INVALID_JSON" in prompt_text
+def test_final_builder_does_not_call_llm_or_preserve_raw_failed_text():
+    with patch("app.run_safe_agent", side_effect=AssertionError("final builder must not call LLM")):
+        result = app.run_final_builder_phase("key", {"canonical_models": []}, {}, {}, [{"agent": "a", "error": "INVALID_JSON", "raw_preview": "SECRET_RAW"}], "Hyundai", "Israel", "2010-2026")
+    output_text = json.dumps(result, ensure_ascii=False)
+    assert result["finish_reason"] == "python_merge_success"
+    assert "SECRET_RAW" not in output_text
+    assert "INVALID_JSON" in output_text
 
 
 def test_global_only_sources_are_marked_needs_review_by_verifier_validator():
@@ -198,13 +192,9 @@ def test_global_only_sources_are_marked_needs_review_by_verifier_validator():
     assert parsed["verified_models"][0]["confidence"] == "medium"
 
 
-def test_if_enrichment_agent_fails_final_status_becomes_partial():
-    def fake_safe(*args, **kwargs):
-        return app.phase_result(status="success", agent="final_builder", parsed={"manufacturer": "Hyundai", "market": "Israel", "period": "2010-2026", "status": "complete", "models": [], "needs_review": [], "rejected": [], "failed_agents": [], "token_usage": {}})
-
-    with patch("app.run_safe_agent", side_effect=fake_safe):
-        result = app.run_final_builder_phase("key", {}, {}, {}, [{"agent": "engines", "error": "INVALID_JSON"}], "Hyundai", "Israel", "2010-2026")
-    assert result["parsed"]["status"] == "partial"
+def test_if_enrichment_agent_fails_final_status_becomes_partial_success():
+    result = app.run_final_builder_phase("key", {"canonical_models": [{"canonical_model_name": "i10"}]}, {}, {}, [{"agent": "engines", "error": "INVALID_JSON"}], "Hyundai", "Israel", "2010-2026")
+    assert result["parsed"]["status"] == "partial_success"
 
 
 def test_technical_json_missing_agent_is_repaired_from_agent_name():
@@ -477,3 +467,73 @@ def test_if_all_technical_agents_fail_verifier_and_final_builder_do_not_run(monk
 
     app.run_pipeline("key", "Hyundai", "Israel", "p")
     assert ("error", "Pipeline failed: TECHNICAL_ENRICHMENT_FAILED\nReason: all technical enrichment agents failed.") in events
+
+
+def test_python_final_builder_merges_canonical_models_with_technical_items():
+    normalized = {"canonical_models": [{"canonical_model_name": "Ioniq 5", "aliases": ["IONIQ5"], "sources": ["official"], "confidence": "medium"}]}
+    technical = {
+        "trims_years_agent": {"items": [{"model": "IONIQ 5", "years_sold": "2021-2026", "generation_or_series": "NE", "confidence": "high", "sources": ["trim"]}]},
+        "engines_fuel_power_agent": {"items": [{"model": "ioniq 5", "engine": "EV", "fuel_type": "electric", "power_hp": 217, "confidence": "high", "sources": ["engine"]}]},
+        "transmission_drivetrain_performance_agent": {"items": [{"model": "Ioniq 5", "transmission": "single-speed", "drivetrain": "RWD", "confidence": "medium"}]},
+        "dimensions_safety_equipment_agent": {"items": [{"model": "Ioniq 5", "body_type": "SUV", "seats": 5, "safety": "ADAS", "confidence": "medium"}]},
+    }
+    verifier = {"status": "success", "verified_models": [{"model": "Ioniq 5", "status": "verified", "confidence": "high", "issues": [], "source_strength": "official_israel"}]}
+    result = app.run_final_builder_phase("key", normalized, technical, verifier, [], "Hyundai", "Israel", "2010-2026")
+    model = result["parsed"]["models"][0]
+    assert result["status"] == "success"
+    assert result["finish_reason"] == "python_merge_success"
+    assert model["engine"] == "EV"
+    assert model["transmission"] == "single-speed"
+    assert model["body_type"] == "SUV"
+    assert model["verification_status"] == "verified"
+
+
+def test_python_final_builder_works_when_verifier_partial_or_missing_model():
+    normalized = {"canonical_models": [{"canonical_model_name": "i10", "confidence": "high"}, {"canonical_model_name": "i20", "confidence": "high"}]}
+    verifier = {"status": "partial", "verified_models": [{"model": "i10", "status": "verified", "confidence": "high", "issues": []}], "needs_review": []}
+    result = app.run_final_builder_phase("key", normalized, {}, verifier, [{"agent": "source_verifier", "error": "VERIFIER_CHUNK_FAILED"}], "Hyundai", "Israel", "2010-2026")
+    models = {m["canonical_model_name"]: m for m in result["parsed"]["models"]}
+    assert result["parsed"]["pipeline_quality"]["verifier"] == "partial"
+    assert models["i20"]["verification_status"] == "partial"
+    assert models["i20"]["verification_notes"] == "Verifier did not complete for this model"
+
+
+def test_final_builder_never_returns_model_json_truncated():
+    normalized = {"canonical_models": [{"canonical_model_name": f"m{i}"} for i in range(100)]}
+    with patch("app.run_safe_agent", side_effect=AssertionError("no LLM")):
+        result = app.run_final_builder_phase("key", normalized, {}, {}, [], "Hyundai", "Israel", "2010-2026")
+    assert result.get("error") != "MODEL_JSON_TRUNCATED"
+    assert len(result["parsed"]["models"]) == 100
+
+
+def test_model_matching_uses_model_field_and_aliases():
+    normalized = {"canonical_models": [{"canonical_model_name": "Santa Fe", "aliases": ["Santafe"]}]}
+    technical = {"engines_fuel_power_agent": {"items": [{"model": "santafe", "engine": "2.5T", "confidence": "high"}]}}
+    result = app.run_final_builder_phase("key", normalized, technical, {}, [], "Hyundai", "Israel", "2010-2026")
+    assert result["parsed"]["models"][0]["engine"] == "2.5T"
+
+
+def test_verifier_chunk_size_is_six():
+    assert app.VERIFIER_MODEL_CHUNK_SIZE == 6
+
+
+def test_verifier_issues_are_capped_to_two_and_120_chars():
+    parsed = {"agent": "source_verifier", "verified_models": [{"model": "x", "status": "partial", "confidence": "low", "issues": ["a" * 130, "b", "c"], "source_strength": "unknown"}], "rejected_data_points": [], "needs_review": []}
+    assert app.validate_verifier_schema(parsed) is None
+    assert len(parsed["verified_models"][0]["issues"]) == 2
+    assert len(parsed["verified_models"][0]["issues"][0]) == 120
+
+
+def test_failed_verifier_chunks_are_preserved_as_compact_summaries():
+    merged = app.merge_verifier_results([
+        app.phase_result(status="failed", agent="source_verifier", error="MODEL_JSON_TRUNCATED", raw_preview="SECRET"),
+        app.phase_result(status="success", agent="source_verifier", parsed={"agent": "source_verifier", "verified_models": [{"model": "i10"}], "rejected_data_points": [], "needs_review": []}),
+    ])
+    assert merged["status"] == "partial"
+    assert merged["failed_chunks"] == [{"agent": "source_verifier", "error": "MODEL_JSON_TRUNCATED", "chunk_index": 0}]
+    assert "SECRET" not in json.dumps(merged, ensure_ascii=False)
+
+
+def test_ui_status_data_contains_python_merge_success():
+    result = app.run_final_builder_phase("key", {"canonical_models": []}, {}, {}, [], "Hyundai", "Israel", "2010-2026")
+    assert result["parsed"]["final_builder_method"] == "python_merge_success"
